@@ -121,7 +121,7 @@ public:
 
   enum CreateFlags { PAINT_NULL = 0, PAINT_SW = 1, PAINT_GL = 2, /*PAINT_VTEX = 3,*/ PAINT_MASK = 3,
       PRIVATE_FONTS = 1<<2, NO_TEXT = 1<<3, MULTITHREAD = 1<<4, SRGB_AWARE = 1<<5, SW_NO_XC = 1<<6,
-      SW_BLIT_GL = 1<<7, CACHE_IMAGES = 1<<8, PAINT_DEBUG_GL = 1<<9, ALIGN_SCISSOR = 1<<10 };
+      SW_BLIT_GL = 1<<7, CACHE_IMAGES = 1<<8, PAINT_DEBUG_GL = 1<<9, ALIGN_SCISSOR = 1<<10, SW_FALLBACK = 1<<11 };
 
   Painter(int flags, Image* image = NULL);
   Painter(NVGcontext* _vg, Image* image = NULL);

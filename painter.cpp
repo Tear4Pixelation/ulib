@@ -69,22 +69,22 @@ Painter::Painter(int flags, Image* image)
     //nvgFlags |= (flags & CACHE_IMAGES) ? NVGL_DELETE_NO_GL : 0;
     nvgFlags |= (flags & PAINT_DEBUG_GL) ? NVGL_DEBUG : 0;
     vg = nvglCreate(nvgFlags);
+    if(!vg && !(flags & SW_FALLBACK)) { return; }
   }
 #endif
 #ifndef NO_PAINTER_SW
-  else { //if(flags & PAINT_MASK == PAINT_SW)
+  if(!vg) { //if(flags & PAINT_MASK == PAINT_SW)
     nvgFlags |= (flags & SW_NO_XC) ? 0 : NVGSW_PATHS_XC;
     vg = nvgswCreate(nvgFlags);
+#ifndef NO_PAINTER_SWU
+  if(flags & SW_BLIT_GL)
+    swBlitter = nvgswuCreateBlitter();
+#endif
   }
 #endif
 
   if(sharefons)
     nvgSetFontStash(vg, fontStash);
-
-#ifndef NO_PAINTER_SWU
-  if(flags & SW_BLIT_GL)
-    swBlitter = nvgswuCreateBlitter();
-#endif
 
   if((flags & CACHE_IMAGES) && !cachingPainter)
     cachingPainter = this;

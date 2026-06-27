@@ -301,6 +301,7 @@ void FSPath::normalize()
 #if PLATFORM_WIN
   std::replace(path.begin(), path.end(), '\\', '/');
 #endif
+  if(path.substr(0, 7) == "file://") { path = path.substr(7); }
   size_t n = 0;
   while((n = path.find("//", n)) != std::string::npos)
     path.replace(n, 2, "/");
