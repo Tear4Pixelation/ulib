@@ -307,3 +307,99 @@ bool Palette::matchReference(Color inkbase, int variant, Color* out) const
   *out = families[best].variant(variant);
   return true;
 }
+
+// --- shipped themes --------------------------------------------------------------------------------
+
+// Twelve themes on four axes: vividness, depth, minContrast and paper tint.  Hue is not among them,
+//  for the reason given in the header.  Two constraints the table has to keep, both measured:
+//
+//  - Vividness stays at or above 0.70.  Below that, a *dark* rendering drops to ~0.07 mean chroma and
+//    the eight families crowd to dE 0.032 - under the 0.041 of the palette that already ships, i.e.
+//    visibly harder to tell apart than what users have now.  Muted is a style; indistinguishable is a
+//    bug, and the floor is where the two part company.
+//  - Every theme must be legible in BOTH modes.  The generator's walk guarantees minContrast against
+//    whatever paper it is given, so this falls out - but only because the toggle feeds it a real
+//    paperL rather than a theme pretending a light recipe will do on black.
+static const PaletteTheme s_paletteThemes[] = {
+  //  id            name            vivid depth contrast warm  offset
+  { "bright",     "Bright",         1.00, 0.02,   3.0,   0.35,  0.00 },
+  { "ink",        "Ink",            0.95, 0.20,   4.5,   0.30,  0.00 },
+  { "soft",       "Soft",           0.90, 0.10,   3.5,   0.35,  0.01 },
+  { "cream",      "Cream",          0.95, 0.06,   3.5,   1.00,  0.04 },
+  { "parchment",  "Parchment",      0.92, 0.18,   4.0,   1.00,  0.06 },
+  { "slate",      "Slate",          0.95, 0.12,   4.0,   0.00,  0.08 },
+  { "pastel",     "Pastel",         0.90, 0.02,   3.0,   0.60,  0.02 },
+  { "bold",       "Bold",           1.00, 0.12,   5.0,   0.15,  0.00 },
+  { "sepia",      "Sepia",          0.92, 0.22,   4.5,   1.00,  0.07 },
+  { "cool",       "Cool",           0.95, 0.06,   3.5,   0.00,  0.02 },
+  { "graphite",   "Graphite",       0.95, 0.12,   4.0,   0.15,  0.09 },
+  { "deep",       "Deep",           0.95, 0.16,   4.5,   0.35,  0.04 },
+};
+static const int s_numPaletteThemes = int(sizeof(s_paletteThemes)/sizeof(s_paletteThemes[0]));
+
+int paletteThemeCount() { return s_numPaletteThemes; }
+
+const PaletteTheme* paletteThemeByIndex(int i)
+  { return i >= 0 && i < s_numPaletteThemes ? &s_paletteThemes[i] : NULL; }
+
+const PaletteTheme* paletteThemeById(const char* id)
+{
+  if(!id || !id[0])
+    return NULL;
+  for(int ii = 0; ii < s_numPaletteThemes; ++ii) {
+    if(strcmp(s_paletteThemes[ii].id, id) == 0)
+      return &s_paletteThemes[ii];
+  }
+  return NULL;
+}
+
+PaletteRecipe paletteThemeRecipe(const PaletteTheme& theme, bool dark)
+{
+  PaletteRecipe recipe;
+  // explicit, never the struct's defaults - the same rule referencePalette() follows, so that retuning
+  //  a default cannot silently redefine what a shipped theme means
+  recipe.gen = defaultPaletteGen()->id;
+  recipe.seedHue = 218;
+  recipe.vividness = theme.vividness;
+  recipe.depth = theme.depth;
+  recipe.minContrast = theme.minContrast;
+  recipe.jitter = 11;
+  recipe.paperWarm = theme.paperWarm;
+  recipe.families = 12;
+  // the one place light-vs-dark is decided; the offset is the theme's own tint, kept on both sides
+  recipe.paperL = dark ? real(0.10) + theme.paperOffset : real(0.99) - theme.paperOffset;
+  // Contrast is capped on dark paper, and this is not a fudge: the walk steps *away* from the paper,
+  //  so a high floor means darker, richer ink on white and lighter, bleached ink on black.  Left
+  //  uncapped, "Deep" and "Contrast" come out as the palest themes in dark mode - their identity
+  //  inverts.  Measured: 7.0 on near-black paper lands at 0.067 mean chroma against 0.113 in light
+  //  mode.  4.5 is already far above what near-black paper needs for legibility.
+  if(dark && recipe.minContrast > real(4.5))
+    recipe.minContrast = real(4.5);
+  return recipe;
+}
+
+// Fields are compared with a tolerance, not exactly.  `real` is double but a recipe round-trips
+//  through the config as float (ScribbleConfig::themeRecipe), so a theme read back from a saved
+//  document is a few ulps off the table it came from - and an exact comparison then says the document
+//  has no theme, leaving the gallery with nothing selected and the dark-paper toggle with nothing to
+//  restore.  No two shipped themes differ by less than 0.01 in any field, so 1e-4 cannot collide.
+static bool recipeFieldEq(real a, real b) { return std::fabs(a - b) < real(1e-4); }
+
+int paletteThemeIndexOf(const PaletteRecipe& recipe)
+{
+  for(int ii = 0; ii < s_numPaletteThemes; ++ii) {
+    const PaletteTheme& theme = s_paletteThemes[ii];
+    // paperL is deliberately not compared: it carries the mode, which is not part of a theme's
+    //  identity.  The offset is checked against whichever side of the mirror the recipe is on.
+    bool dark = recipe.paperL <= real(0.5);
+    // built the same way the recipe was, so the dark-mode contrast cap is applied to both sides of
+    //  the comparison - otherwise a dark "Contrast" stops recognising itself and loses its ring
+    PaletteRecipe want = paletteThemeRecipe(theme, dark);
+    if(recipeFieldEq(recipe.vividness, want.vividness) && recipeFieldEq(recipe.depth, want.depth)
+        && recipeFieldEq(recipe.minContrast, want.minContrast)
+        && recipeFieldEq(recipe.paperWarm, want.paperWarm)
+        && recipeFieldEq(recipe.paperL, want.paperL) && recipe.families == want.families)
+      return ii;
+  }
+  return -1;
+}

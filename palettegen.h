@@ -32,6 +32,12 @@ struct PaletteRecipe
   real jitter     = 11;     // deterministic hue scatter, degrees
   real paperL     = 0.99;
   real paperWarm  = 0.35;
+  // 12, and a reduction to 8 was tried and reverted.  Fewer families do separate better on LIGHT
+  //  paper (min pairwise dE 0.055 vs 0.041), and the plan was to restore the picker's richness from
+  //  each family's dark variant.  On DARK paper that inverts: 12 bases measure 0.066 while 8 families
+  //  with their darks measure 0.014, because the walk has already pushed ink up toward light and
+  //  `dL = min(0.92, L + 0.13)` then clamps a dark on top of its own base.  Hue variety is also what
+  //  a note-taking palette is actually asked for - red AND blue AND green - which shades do not give.
   int  families   = 12;
 
   friend bool operator==(const PaletteRecipe& a, const PaletteRecipe& b);
@@ -106,3 +112,39 @@ bool generatePalette(const PaletteRecipe& recipe, Palette* out);
 // The fixed palette that __inkbase values are quoted against (COLORS_SPEC.md §5.3).  Its recipe is frozen
 //  along with the generator that builds it.
 const Palette& referencePalette();
+
+// --- shipped themes --------------------------------------------------------------------------------
+//
+// The themes the picker offers.  A theme is INK CHARACTER plus PAPER TINT; it deliberately does NOT
+//  own light-vs-dark, which is the dialog's toggle.  paperL does two jobs - which side of the
+//  generator's mirror, and how light exactly - and only the second belongs to a theme.  Letting a
+//  theme set paperL outright makes "vivid ink on white" and "vivid ink on black" two separate entries
+//  when they are one theme seen in two modes.
+//
+// Hue is NOT a theme axis, and that is measured rather than assumed: with families spread over the
+//  full wheel, two palettes 180 degrees apart differ by a mean of 10 degrees per color - less than the
+//  jitter.  Restricting the hue span would make seeds matter, but a 120-degree theme has no blue in
+//  it at all, which is not a palette anyone can take notes with.  So every theme covers the whole
+//  wheel and they differ by how the ink sits on the page instead.
+struct PaletteTheme
+{
+  const char* id;       // stable, but never stored - the document stores the resulting recipe
+  const char* name;
+  real vividness;
+  real depth;
+  real minContrast;
+  real paperWarm;
+  real paperOffset;     // how far this theme's paper sits from pure white / pure black
+};
+
+int paletteThemeCount();
+const PaletteTheme* paletteThemeByIndex(int i);
+const PaletteTheme* paletteThemeById(const char* id);
+
+// The recipe for a theme.  `dark` is the only thing that decides which side of the mirror the paper
+//  sits on, so the same theme has a light and a dark rendering rather than a light and a dark entry.
+PaletteRecipe paletteThemeRecipe(const PaletteTheme& theme, bool dark);
+
+// Which shipped theme a recipe came from, or -1.  Matches on the character fields only, so a recipe
+//  still resolves to its theme after the dark toggle has moved paperL.  Used to ring the active tile.
+int paletteThemeIndexOf(const PaletteRecipe& recipe);
