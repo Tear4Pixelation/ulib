@@ -12,6 +12,21 @@ class Path2D;
 struct NVGLUframebuffer;
 struct NVGSWUblitter;
 
+// A render-time color transform (night mode): applied to every solid color and gradient stop the painter
+//  emits, never to document data - so exports, thumbnails and copies are untouched.  Images do not pass
+//  through it.  map() is called once per fill/stroke, so implementations should cache.
+class ColorMap
+{
+public:
+  virtual ~ColorMap() {}
+  virtual Color map(Color c) const = 0;
+  // Images opt in with a nonzero key; the painter caches one rewritten texture per image per key, so the
+  //  pixel work runs once per image rather than per frame (on the caching painter).
+  virtual int imageKey() const { return 0; }
+  // rewrite w*h RGBA pixels in place; return false *without touching them* to leave the image as it is
+  virtual bool mapImagePixels(unsigned char* rgba, int w, int h) const { return false; }
+};
+
 class Painter
 {
 public:
@@ -100,7 +115,7 @@ public:
     // other
     Rect clipBounds = Rect::ltrb(REAL_MIN, REAL_MIN, REAL_MAX, REAL_MAX);
     float globalAlpha = 1.0;
-    color_t colorXorMask = 0;
+    const ColorMap* colorMap = NULL;
     CompOp compOp = CompOp_SrcOver;
     bool antiAlias = true;
     bool sRGBAdjAlpha = false;
@@ -217,7 +232,8 @@ public:
   void setAtlasTextThreshold(float thresh);
 
   void setsRGBAdjAlpha(bool adj) { currState().sRGBAdjAlpha = adj; }
-  void setColorXorMask(color_t mask) { currState().colorXorMask = mask; }
+  void setColorMap(const ColorMap* map) { currState().colorMap = map; }
+  const ColorMap* colorMap() const { return currState().colorMap; }
 
   // background color
   void setBackgroundColor(const Color& c) { bgColor = c; }

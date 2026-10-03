@@ -36,7 +36,8 @@ Image::Image(int w, int h, Encoding imgfmt) : Image(w, h, NULL, imgfmt)
 
 Image::Image(Image&& other) : width(std::exchange(other.width, 0)), height(std::exchange(other.height, 0)),
     data(std::exchange(other.data, nullptr)), encData(std::move(other.encData)),
-    encoding(other.encoding), painterHandle(std::exchange(other.painterHandle, -1)) {}
+    encoding(other.encoding), painterHandle(std::exchange(other.painterHandle, -1)),
+    mappedHandle(std::exchange(other.mappedHandle, -1)), mappedKey(std::exchange(other.mappedKey, 0)) {}
 
 Image& Image::operator=(Image&& other)
 {
@@ -46,6 +47,8 @@ Image& Image::operator=(Image&& other)
   std::swap(encData, other.encData);
   std::swap(encoding, other.encoding);
   std::swap(painterHandle, other.painterHandle);
+  std::swap(mappedHandle, other.mappedHandle);
+  std::swap(mappedKey, other.mappedKey);
   return *this;
 }
 
@@ -86,6 +89,10 @@ void Image::invalidate()
   encData.clear();
   Painter::invalidateImage(painterHandle, dataLen());
   painterHandle = -1;
+  if(mappedHandle >= 0)
+    Painter::invalidateImage(mappedHandle, dataLen());
+  mappedHandle = -1;
+  mappedKey = 0;
 }
 
 // use Painter for image transformations

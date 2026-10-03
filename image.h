@@ -16,6 +16,11 @@ public:
   mutable EncodeBuff encData;
   enum Encoding {UNKNOWN=0, PNG=1, JPEG=2} encoding;  // preferred encoding
   mutable int painterHandle;
+  // texture of this image as rewritten by a ColorMap (night mode), for the map whose imageKey() is
+  //  mappedKey; mappedHandle == UNMAPPED records that the map chose to leave this image alone (a photo)
+  mutable int mappedHandle = -1;
+  mutable int mappedKey = 0;
+  static constexpr int UNMAPPED = -2;
 
   Image(int w, int h, Encoding imgfmt = UNKNOWN);
   Image(Image&& other);

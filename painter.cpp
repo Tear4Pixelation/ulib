@@ -463,19 +463,48 @@ void Painter::fillRect(Rect rect, Color c)
 
 void Painter::drawImage(const Rect& dest, const Image& image, Rect src, int flags)
 {
+  // night mode: the map may want a rewritten copy of this image - unless it already declined this one
+  const ColorMap* colorMap = currState().colorMap;
+  int mapKey = colorMap ? colorMap->imageKey() : 0;
+  if(mapKey && image.mappedKey == mapKey && image.mappedHandle == Image::UNMAPPED)
+    mapKey = 0;
+  int cachedHandle = !mapKey ? image.painterHandle : image.mappedKey == mapKey ? image.mappedHandle : -1;
+
   // we are using the fact that a nanovg instance assigns monotonically increasing image (texture) handles
   int handle;
-  if(this == cachingPainter && !imgHandles.empty() && image.painterHandle >= imgHandles.front())
-    handle = image.painterHandle;
+  if(this == cachingPainter && !imgHandles.empty() && cachedHandle >= imgHandles.front())
+    handle = cachedHandle;
   else {
     //flags |= NVG_IMAGE_GENERATE_MIPMAPS; ... just seemed to make things more blurry
     flags |= sRGB() ? NVG_IMAGE_SRGB : 0;
     flags |= (this != cachingPainter) ? NVG_IMAGE_DISCARD : 0;
     auto bytes = image.bytesOnce();
-    handle = nvgCreateImageRGBA(vg, image.width, image.height, flags, bytes);
+    if(mapKey) {
+      if(bytes == image.data) {
+        bytes = (unsigned char*)malloc(image.dataLen());
+        memcpy(bytes, image.data, image.dataLen());
+      }
+      if(!colorMap->mapImagePixels(bytes, image.width, image.height)) {
+        // remembered even on a non-caching painter, so the decision is made once per image
+        image.mappedKey = mapKey;
+        image.mappedHandle = Image::UNMAPPED;
+        mapKey = 0;
+      }
+    }
+    bool reuse = !mapKey && this == cachingPainter && !imgHandles.empty()
+        && image.painterHandle >= imgHandles.front();  // declined, and the plain texture is cached
+    handle = reuse ? image.painterHandle
+        : nvgCreateImageRGBA(vg, image.width, image.height, flags, bytes);
     if(bytes != image.data) free(bytes);
-    if(this == cachingPainter) {
-      image.painterHandle = handle;
+    if(this == cachingPainter && !reuse) {
+      if(mapKey) {
+        if(image.mappedHandle >= 0)
+          invalidateImage(image.mappedHandle, image.dataLen());  // made for a different key
+        image.mappedHandle = handle;
+        image.mappedKey = mapKey;
+      }
+      else
+        image.painterHandle = handle;
       imgHandles.push_back(handle);
       cachedBytes += image.dataLen();
     }
@@ -709,22 +738,27 @@ NVGpaint Painter::getGradientPaint(const Gradient* grad)
   }
 
   if(multi) {
-    int handle = this == cachingPainter ? grad->painterHandle.handle : -1;
+    // the texture bakes in stop colors, so with a color map (night mode) it is built per draw, not cached -
+    //  a cached one would keep whichever mode it was first drawn in
+    const ColorMap* colorMap = currState().colorMap;
+    bool caching = this == cachingPainter && !colorMap;
+    int handle = caching ? grad->painterHandle.handle : -1;
     if(handle <= 0) {  //imgHandleBase
       auto& stops = grad->stops();
+      auto stopColor = [colorMap](Color c){ return colorMap ? colorMap->map(c) : c; };
       // in general, we can't premultiply in sRGB space, so we don't use premultiplied texture
-      int flags = (this != cachingPainter ? NVG_IMAGE_DISCARD : 0) | (sRGB() ? NVG_IMAGE_SRGB : 0);
+      int flags = (!caching ? NVG_IMAGE_DISCARD : 0) | (sRGB() ? NVG_IMAGE_SRGB : 0);
       if(grad->colorInterp == Gradient::LinearColorInterp) {
         size_t w = 256;
         std::vector<color_t> img(w);
         real f = 0, fstep = 1.0/(w - 1);
-        ColorF c0 = sRGBtoLinear(stops[0].second);
-        ColorF c1 = sRGBtoLinear(stops[1].second);
+        ColorF c0 = sRGBtoLinear(stopColor(stops[0].second));
+        ColorF c1 = sRGBtoLinear(stopColor(stops[1].second));
         for (size_t pidx = 0, sidx = 0; pidx < w; ++pidx) {
           while (f > stops[sidx+1].first && sidx < stops.size() - 2) {
             ++sidx;
-            c0 = sRGBtoLinear(stops[sidx].second);
-            c1 = sRGBtoLinear(stops[sidx+1].second);
+            c0 = sRGBtoLinear(stopColor(stops[sidx].second));
+            c1 = sRGBtoLinear(stopColor(stops[sidx+1].second));
           }
           ColorF c = colorInterpF(c0, c1, (f - stops[sidx].first)/(stops[sidx+1].first - stops[sidx].first));
           img[pidx] = linearTosRGB(c).color;  // this is why we can't use nvgMultiGradient for this case
@@ -743,7 +777,7 @@ NVGpaint Painter::getGradientPaint(const Gradient* grad)
         }
         handle = nvgMultiGradient(vg, flags, fstops.data(), colors.data(), fstops.size());
       }
-      if(this == cachingPainter)
+      if(caching)
         grad->painterHandle.handle = handle;
     }
     paint.image = handle;
@@ -858,7 +892,8 @@ NVGcolor Painter::colorToNVGColor(Color color, float alpha)
   float a = alpha >= 0 ? alpha : color.alpha() / 255.0f;
   if(a < 1.0f && a > 0.0f && sRGB() && currState().sRGBAdjAlpha)
     a = 1.0f - std::pow(1.0f - a, 2.2f);
-  color.color ^= currState().colorXorMask;
+  if(currState().colorMap)
+    color = currState().colorMap->map(color);
   return nvgRGBA(color.red(), color.green(), color.blue(), (unsigned char)(a*255.0f + 0.5f));
 }
 
