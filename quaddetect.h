@@ -6,8 +6,9 @@
 // This only has to produce a good *initial guess* - the user can drag any corner afterwards - which is
 //  what makes it reasonable to do without OpenCV.  A wrong guess costs one drag; refusing to guess costs
 //  four.  So the bar is "usually right and never absurd", not "always right".
-// Pipeline: downscale to a few hundred pixels, Sobel, gradient-directed Hough, then pick the outermost
-//  near-horizontal and near-vertical line of each pair and intersect them.
+// Pipeline: downscale to a few hundred pixels, Sobel with thinning, gradient-directed Hough that keeps each
+//  line's polarity (which side is brighter), then score every combination of a left, top, right and bottom
+//  candidate by how much of each side - between its corners - looks like a page edge, and refit the winner.
 // Buffers are the usual Image layout: 4 bytes per pixel, alpha at byte offset 3.
 
 // quad is filled with the corners in source pixel coords, ordered TL, TR, BR, BL.

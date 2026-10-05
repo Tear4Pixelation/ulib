@@ -2,20 +2,31 @@
 #include "imagewarp.h"  // isConvexQuad
 
 #include <stdint.h>
+#include <algorithm>
 #include <vector>
 
 // Tuning constants.  These are all "usually right" thresholds rather than exact quantities, so they are
 //  collected here to be retuned against real photos rather than scattered through the code.
 static const int TARGET_LONG_EDGE = 480;    // everything below runs on an image this size, so it is fast
-static const float EDGE_FRACTION = 0.08f;   // fraction of pixels kept as edges, by gradient magnitude
-static const float MIN_EDGE_STRENGTH = 0.1f;   // ...but never weaker than this fraction of the strongest
+static const float MIN_EDGE_MAGNITUDE = 10;  // Sobel |gx|+|gy| on 0-255 grey: a step of about 4 levels
+static const float NOISE_MULTIPLE = 1.5f;   // ...or this many times the median gradient, if that is larger
 static const int THETA_SPREAD_DEG = 6;      // how far either side of the gradient direction to vote
-static const int NUM_THETA = 360;           // half a degree per bin
-static const float THETA_STEP = 180.0f/NUM_THETA;
+static const int NUM_THETA = 720;           // half a degree per bin, over the full circle (see findLines)
+static const float THETA_STEP = 360.0f/NUM_THETA;
 static const int NMS_RADIUS = 6;            // peak suppression window in the accumulator
-static const float MIN_VOTE_FRACTION = 0.2f;   // a line must poll this fraction of the best line
+static const int MAX_LINES_PER_FAMILY = 24; // candidates kept for each of the two orientations
+static const float MIN_LINE_VOTES = 0.12f;  // a candidate line needs this many votes, relative to the short side
 static const float MIN_SEPARATION = 0.25f;  // opposite edges must be this far apart, relative to the image
 static const float MIN_AREA_FRACTION = 0.15f;  // the page must fill at least this much of the photo
+static const int SUPPORT_SEARCH = 2;        // how far off a side an edge pixel may be and still support it
+static const float SUPPORT_ANGLE_DEG = 22;  // ...and how well its gradient must point into the page
+static const int CONTRAST_OFFSET = 4;       // the page side of an edge is sampled this far in, the outside this far out
+static const float MIN_CONTRAST = 3;        // grey levels the inside must be brighter than the outside
+static const float MIN_SIDE_SUPPORT = 0.25f;  // every side must be supported along this fraction of its length
+static const float MIN_TOTAL_SUPPORT = 2.2f;   // ...and the four sides together this much (out of 4)
+static const float EXTENSION_FRACTION = 0.15f;  // how far past each corner to look for an edge running on
+static const float OVERRUN_PENALTY = 0.6f;  // ...and how much of a side's support that costs it
+static const float AREA_WEIGHT = 0.3f;      // tie break toward the larger quad when support is equal
 static const float REFIT_DISTANCE = 2.5f;   // how close an edge pixel must be to count toward a refit
 static const float REFIT_ANGLE_DEG = 20;    // ...and how well its gradient must agree with the line
 static const int MIN_REFIT_POINTS = 20;
@@ -25,9 +36,23 @@ struct GreyImage {
   int width = 0;
   int height = 0;
   int scale = 1;  // how many source pixels per sample, so corners can be scaled back up
+
+  float at(int x, int y) const {
+    x = std::min(width - 1, std::max(0, x));
+    y = std::min(height - 1, std::max(0, y));
+    return samples[size_t(y)*width + x];
+  }
 };
 
-// a pixel that sits on an edge, with the direction of that edge's normal
+// Sobel output, kept per pixel because side scoring looks pixels up by position
+struct GradientImage {
+  std::vector<float> gx, gy;
+  std::vector<uint8_t> isEdge;  // above threshold *and* a local maximum across the edge
+  int width = 0;
+  int height = 0;
+};
+
+// a pixel that sits on an edge, with the direction of its gradient (pointing toward the brighter side)
 struct EdgePoint {
   float x = 0;
   float y = 0;
@@ -85,15 +110,23 @@ static void blur3x3(GreyImage& grey)
   grey.samples.swap(blurred);
 }
 
-// Sobel, then keep only the pixels that look like they are on an edge.
-static std::vector<EdgePoint> findEdgePoints(const GreyImage& grey)
+// Sobel, then thin the edges to one pixel (Canny style non-maximum suppression) and threshold them.
+// The threshold is absolute, with a noise floor, rather than a percentile of the photo's own gradients:
+//  a percentile is set by whatever is strongest in the frame - wood grain, a checked tablecloth,
+//  handwriting - and on a white desk the page outline is far weaker than any of those, so a relative
+//  cut drops it.  Thinning is what keeps an absolute threshold from admitting whole blurred bands.
+static GradientImage computeGradients(const GreyImage& grey, std::vector<EdgePoint>& edgePoints)
 {
-  std::vector<EdgePoint> edgePoints;
+  GradientImage gradient;
+  gradient.width = grey.width;
+  gradient.height = grey.height;
+  size_t nSamples = size_t(grey.width)*grey.height;
+  gradient.gx.assign(nSamples, 0.0f);
+  gradient.gy.assign(nSamples, 0.0f);
+  gradient.isEdge.assign(nSamples, 0);
   if(grey.width < 8 || grey.height < 8)
-    return edgePoints;
-  std::vector<float> magnitude(size_t(grey.width)*grey.height, 0.0f);
-  std::vector<float> angleDeg(size_t(grey.width)*grey.height, 0.0f);
-  float maxMagnitude = 0;
+    return gradient;
+  std::vector<float> magnitude(nSamples, 0.0f);
   for(int y = 1; y < grey.height - 1; ++y) {
     for(int x = 1; x < grey.width - 1; ++x) {
       const float* row = &grey.samples[size_t(y)*grey.width + x];
@@ -103,50 +136,57 @@ static std::vector<EdgePoint> findEdgePoints(const GreyImage& grey)
       float gy = (row[stride - 1] + 2*row[stride] + row[stride + 1])
                - (row[-stride - 1] + 2*row[-stride] + row[-stride + 1]);
       size_t index = size_t(y)*grey.width + x;
+      gradient.gx[index] = gx;
+      gradient.gy[index] = gy;
       magnitude[index] = std::abs(gx) + std::abs(gy);
-      // the gradient points across the edge, so it is the normal direction of the line through it
-      angleDeg[index] = float(std::atan2(gy, gx)*180/M_PI);
-      maxMagnitude = std::max(maxMagnitude, magnitude[index]);
     }
   }
-  if(maxMagnitude <= 0)
-    return edgePoints;
 
-  // Keep the strongest EDGE_FRACTION of pixels - a percentile rather than a fixed threshold, so a low
-  //  contrast photo is not simply discarded.  The floor matters as much as the percentile: a page
-  //  outline is only about 1% of the pixels, so "top 8%" on a clean photo reaches well down into the
-  //  flat interior, and flat pixels have a gradient of (0,0), whose atan2 is 0 - which would send the
-  //  entire background to the same orientation bin and bury the real edges under invented lines.
-  int histogram[256] = {0};
-  size_t nSamples = magnitude.size();
-  for(size_t ii = 0; ii < nSamples; ++ii)
-    ++histogram[int(magnitude[ii]*255/maxMagnitude)];
-  size_t wanted = size_t(nSamples*EDGE_FRACTION);
-  size_t counted = 0;
-  int cutoffBin = 255;
-  for(int bin = 255; bin >= 0; --bin) {
-    counted += histogram[bin];
-    if(counted >= wanted) { cutoffBin = bin; break; }
-  }
-  float threshold = std::max(cutoffBin*maxMagnitude/255, maxMagnitude*MIN_EDGE_STRENGTH);
+  // the median gradient is the noise level (most of any photo is flat), so sensor and JPEG noise on a
+  //  dim photo raise the threshold instead of flooding the accumulator
+  std::vector<float> sorted;
+  sorted.reserve(nSamples/16 + 1);
+  for(size_t ii = 0; ii < nSamples; ii += 16)
+    sorted.push_back(magnitude[ii]);
+  std::nth_element(sorted.begin(), sorted.begin() + sorted.size()/2, sorted.end());
+  float threshold = std::max(MIN_EDGE_MAGNITUDE, NOISE_MULTIPLE*sorted[sorted.size()/2]);
 
-  for(int y = 1; y < grey.height - 1; ++y) {
-    for(int x = 1; x < grey.width - 1; ++x) {
+  for(int y = 2; y < grey.height - 2; ++y) {
+    for(int x = 2; x < grey.width - 2; ++x) {
       size_t index = size_t(y)*grey.width + x;
-      if(magnitude[index] < threshold)
+      float value = magnitude[index];
+      if(value < threshold)
         continue;
+      // neighbors across the edge, along the gradient direction quantized to 45 degrees
+      float gx = gradient.gx[index], gy = gradient.gy[index];
+      int stepX = 0, stepY = 0;
+      float absX = std::abs(gx), absY = std::abs(gy);
+      if(absX > 2.414f*absY) stepX = 1;
+      else if(absY > 2.414f*absX) stepY = 1;
+      else { stepX = 1;  stepY = (gx > 0) == (gy > 0) ? 1 : -1; }
+      float before = magnitude[size_t(y - stepY)*grey.width + x - stepX];
+      float after = magnitude[size_t(y + stepY)*grey.width + x + stepX];
+      if(value < before || value <= after)
+        continue;
+      gradient.isEdge[index] = 1;
       EdgePoint point;
       point.x = float(x);
       point.y = float(y);
-      point.angleDeg = angleDeg[index];
+      // the gradient points across the edge, so it is the normal direction of the line through it
+      point.angleDeg = float(std::atan2(gy, gx)*180/M_PI);
       edgePoints.push_back(point);
     }
   }
-  return edgePoints;
+  return gradient;
 }
 
-// gradient-directed Hough: each edge pixel only votes for orientations near its own gradient, which is
-//  both much cheaper than voting for all of them and much less prone to inventing lines out of texture
+// Gradient-directed Hough: each edge pixel only votes for orientations near its own gradient, which is
+//  both much cheaper than voting for all of them and much less prone to inventing lines out of texture.
+// The accumulator covers a full 360 degrees rather than 180, so a line keeps its *polarity*: its normal
+//  points toward the brighter side.  A page edge is always bright on the page side, and keeping the two
+//  polarities apart matters most where they sit next to each other - the page's drop shadow puts a
+//  dark-to-light edge two or three pixels outside the light-to-dark page edge, and with 180 degrees the
+//  two merged into one peak that sat on the shadow and missed the page.
 static std::vector<HoughLine> findLines(const std::vector<EdgePoint>& edgePoints, int width, int height)
 {
   std::vector<HoughLine> lines;
@@ -163,27 +203,18 @@ static std::vector<HoughLine> findLines(const std::vector<EdgePoint>& edgePoints
   int spreadBins = int(THETA_SPREAD_DEG/THETA_STEP);
   for(size_t ii = 0; ii < edgePoints.size(); ++ii) {
     const EdgePoint& point = edgePoints[ii];
-    int centerBin = int(point.angleDeg/THETA_STEP + 0.5f);
+    int centerBin = int(std::floor(point.angleDeg/THETA_STEP + 0.5f));
     for(int offset = -spreadBins; offset <= spreadBins; ++offset) {
-      // theta and theta+180 describe the same line, and using the normalized bin's own cos/sin makes
-      //  rho come out with the matching sign automatically
-      int t = (centerBin + offset) % NUM_THETA;
-      if(t < 0)
-        t += NUM_THETA;
-      int rhoIndex = int(point.x*cosTable[t] + point.y*sinTable[t] + 0.5f) + diagonal;
+      int t = ((centerBin + offset) % NUM_THETA + NUM_THETA) % NUM_THETA;
+      int rhoIndex = int(std::floor(point.x*cosTable[t] + point.y*sinTable[t] + 0.5f)) + diagonal;
       if(rhoIndex >= 0 && rhoIndex < numRho)
         ++accumulator[size_t(t)*numRho + rhoIndex];
     }
   }
 
-  int bestVotes = 0;
-  for(size_t ii = 0; ii < accumulator.size(); ++ii)
-    bestVotes = std::max(bestVotes, accumulator[ii]);
-  if(bestVotes <= 0)
-    return lines;
-  int minVotes = std::max(int(bestVotes*MIN_VOTE_FRACTION), 8);
-
-  // local maxima only, so one strong edge yields one line rather than a smear of near duplicates
+  int minVotes = std::max(int(std::min(width, height)*MIN_LINE_VOTES), 8);
+  // local maxima only, so one strong edge yields one line rather than a smear of near duplicates.  Theta
+  //  wraps around: bin 0 and bin NUM_THETA-1 are neighbors.
   for(int t = 0; t < NUM_THETA; ++t) {
     for(int r = 0; r < numRho; ++r) {
       int votes = accumulator[size_t(t)*numRho + r];
@@ -191,11 +222,14 @@ static std::vector<HoughLine> findLines(const std::vector<EdgePoint>& edgePoints
         continue;
       bool isPeak = true;
       for(int dt = -NMS_RADIUS; dt <= NMS_RADIUS && isPeak; ++dt) {
+        int nt = ((t + dt) % NUM_THETA + NUM_THETA) % NUM_THETA;
         for(int dr = -NMS_RADIUS; dr <= NMS_RADIUS; ++dr) {
-          int nt = t + dt, nr = r + dr;
-          if(nt < 0 || nt >= NUM_THETA || nr < 0 || nr >= numRho || (dt == 0 && dr == 0))
+          int nr = r + dr;
+          if((dt == 0 && dr == 0) || nr < 0 || nr >= numRho)
             continue;
-          if(accumulator[size_t(nt)*numRho + nr] > votes) { isPeak = false; break; }
+          int other = accumulator[size_t(nt)*numRho + nr];
+          // ties go to one side only, so a flat-topped peak still yields exactly one line
+          if(other > votes || (other == votes && (dt < 0 || (dt == 0 && dr < 0)))) { isPeak = false; break; }
         }
       }
       if(isPeak) {
@@ -210,22 +244,134 @@ static std::vector<HoughLine> findLines(const std::vector<EdgePoint>& edgePoints
   return lines;
 }
 
-// smallest difference between two orientations, treating a direction and its opposite as the same
-static float orientationDelta(float aDeg, float bDeg)
+// smallest difference between two directions, in degrees (0 - 180)
+static float angleDelta(float aDeg, float bDeg)
 {
-  float delta = std::fmod(std::abs(aDeg - bDeg), 180.0f);
-  return delta > 90 ? 180 - delta : delta;
+  float delta = std::fmod(std::abs(aDeg - bDeg), 360.0f);
+  return delta > 180 ? 360 - delta : delta;
+}
+
+// A candidate line, with how well each stretch of it looks like the edge of a page lying on its +normal
+//  side.  Positions along the line are integer steps t from its foot point; the prefix sums make "how
+//  much of the segment between these two corners is supported" an O(1) lookup, so every combination of
+//  lines can be scored.
+struct LineSupport {
+  HoughLine line;
+  Point foot;        // rho*normal
+  Point normal;      // toward the brighter side, i.e. into the page
+  Point direction;   // along the line
+  int tMin = 0;      // t of the first entry in the prefix sums
+  std::vector<int> insideImage;   // prefix count of samples that fall inside the image
+  std::vector<int> supported;     // ...that look like a page edge
+};
+
+// Is there an edge here with the page (the brighter side) in direction inward?  Two tests, both needed:
+//  an edge pixel nearby whose gradient points into the page, and the page side actually being brighter
+//  a few pixels away.  The second is what rejects ruled lines, text lines and pencil marks *inside* the
+//  page: they have edges of either polarity, but the paper either side of them is the same brightness.
+static bool looksLikePageEdge(const GreyImage& grey, const GradientImage& gradient, Point at, Point inward)
+{
+  static const float minCos = float(std::cos(degToRad(SUPPORT_ANGLE_DEG)));
+  bool foundEdge = false;
+  for(int step = -SUPPORT_SEARCH; step <= SUPPORT_SEARCH && !foundEdge; ++step) {
+    int x = int(std::floor(at.x + inward.x*step + 0.5));
+    int y = int(std::floor(at.y + inward.y*step + 0.5));
+    if(x < 0 || y < 0 || x >= gradient.width || y >= gradient.height)
+      continue;
+    size_t index = size_t(y)*gradient.width + x;
+    if(!gradient.isEdge[index])
+      continue;
+    float gx = gradient.gx[index], gy = gradient.gy[index];
+    float length = std::sqrt(gx*gx + gy*gy);
+    foundEdge = length > 0 && (gx*inward.x + gy*inward.y) >= minCos*length;
+  }
+  if(!foundEdge)
+    return false;
+  Point inside = at + inward*CONTRAST_OFFSET, outside = at - inward*CONTRAST_OFFSET;
+  float insideValue = grey.at(int(std::floor(inside.x + 0.5)), int(std::floor(inside.y + 0.5)));
+  float outsideValue = grey.at(int(std::floor(outside.x + 0.5)), int(std::floor(outside.y + 0.5)));
+  return insideValue - outsideValue >= MIN_CONTRAST;
+}
+
+static LineSupport measureLineSupport(const GreyImage& grey, const GradientImage& gradient, const HoughLine& line)
+{
+  LineSupport support;
+  support.line = line;
+  real theta = degToRad(line.thetaDeg);
+  support.normal = Point(std::cos(theta), std::sin(theta));
+  support.direction = Point(-support.normal.y, support.normal.x);
+  support.foot = support.normal*line.rho;
+  int reach = int(std::sqrt(real(grey.width*grey.width + grey.height*grey.height))) + 2;
+  support.tMin = -reach;
+  int nSteps = 2*reach + 1;
+  support.insideImage.assign(nSteps + 1, 0);
+  support.supported.assign(nSteps + 1, 0);
+  for(int step = 0; step < nSteps; ++step) {
+    Point at = support.foot + support.direction*real(step + support.tMin);
+    bool inside = at.x >= 1 && at.y >= 1 && at.x < grey.width - 2 && at.y < grey.height - 2;
+    bool isEdge = inside && looksLikePageEdge(grey, gradient, at, support.normal);
+    support.insideImage[step + 1] = support.insideImage[step] + (inside ? 1 : 0);
+    support.supported[step + 1] = support.supported[step] + (isEdge ? 1 : 0);
+  }
+  return support;
+}
+
+// prefix sum range [first, last) for the stretch of the line between positions ta and tb
+static void stepRange(const LineSupport& support, real ta, real tb, int* first, int* last)
+{
+  int nSteps = int(support.insideImage.size()) - 1;
+  *first = std::max(0, std::min(nSteps, int(std::ceil(std::min(ta, tb))) - support.tMin));
+  *last = std::max(0, std::min(nSteps, int(std::floor(std::max(ta, tb))) - support.tMin + 1));
+}
+
+// How much of the side from corner a to corner b looks like page edge, from 0 to 1, less a penalty if
+//  the edge carries on past the corners.  A page edge *ends* at the page's corners; a table edge, a
+//  plank seam or a tablecloth stripe runs on, and that is the cheapest way to tell them apart when one
+//  happens to lie close to where the page is.
+static float sideSupport(const LineSupport& support, Point a, Point b)
+{
+  real ta = dot(a - support.foot, support.direction), tb = dot(b - support.foot, support.direction);
+  int first = 0, last = 0;
+  stepRange(support, ta, tb, &first, &last);
+  int length = last - first;
+  if(length <= 0)
+    return 0;
+  int inside = support.insideImage[last] - support.insideImage[first];
+  int count = support.supported[last] - support.supported[first];
+  // A side running out of the frame is judged on the part that is in it, so a page cut off by the photo's
+  //  edge is still found - but at least half of the side must be visible, or a single short stub of edge
+  //  could pass for a whole side.
+  float fraction = float(count)/std::max(inside, (length + 1)/2);
+
+  real extension = std::max(real(6), std::abs(tb - ta)*EXTENSION_FRACTION);
+  real lowT = std::min(ta, tb), highT = std::max(ta, tb);
+  float overrun = 0;
+  int extFirst = 0, extLast = 0;
+  stepRange(support, lowT - extension, lowT - 1, &extFirst, &extLast);
+  int extInside = support.insideImage[extLast] - support.insideImage[extFirst];
+  if(extInside > 0)
+    overrun += float(support.supported[extLast] - support.supported[extFirst])/extInside;
+  stepRange(support, highT + 1, highT + extension, &extFirst, &extLast);
+  extInside = support.insideImage[extLast] - support.insideImage[extFirst];
+  if(extInside > 0)
+    overrun += float(support.supported[extLast] - support.supported[extFirst])/extInside;
+  return fraction - OVERRUN_PENALTY*overrun/2;
 }
 
 // Replace a Hough line with a least squares fit through the edge pixels that support it.  The
 //  accumulator only resolves the angle to half a degree, and half a degree across the long edge of a
 //  4000 pixel photo is tens of pixels of error at the corners - far more than the sub-pixel accuracy a
-//  straight line fit gives for free.
-static bool refineLine(const std::vector<EdgePoint>& edgePoints, HoughLine& line)
+//  straight line fit gives for free.  Only pixels between the side's two corners count, so a table edge
+//  or a ruled line that happens to be collinear beyond the page cannot pull the fit.
+static bool refineLine(const std::vector<EdgePoint>& edgePoints, HoughLine& line, Point endA, Point endB)
 {
   const float originalTheta = line.thetaDeg;
   HoughLine fitted = line;
   bool refined = false;
+  Point along = endB - endA;
+  real alongLengthSq = dot(along, along);
+  if(alongLengthSq <= 0)
+    return false;
   // Iterate: the first pass only sees the pixels within REFIT_DISTANCE of the accumulator's estimate,
   //  and half a degree of angular error across a long edge is already wider than that window - so the
   //  first fit is biased toward the middle of the edge.  Re-centering the window on the improved line
@@ -239,7 +385,11 @@ static bool refineLine(const std::vector<EdgePoint>& edgePoints, HoughLine& line
       const EdgePoint& point = edgePoints[ii];
       if(std::abs(point.x*normalX + point.y*normalY - fitted.rho) > REFIT_DISTANCE)
         continue;
-      if(orientationDelta(point.angleDeg, fitted.thetaDeg) > REFIT_ANGLE_DEG)
+      if(angleDelta(point.angleDeg, fitted.thetaDeg) > REFIT_ANGLE_DEG)
+        continue;
+      // stay off the corners too: near them the other side's edge pixels are within reach
+      real position = dot(Point(point.x, point.y) - endA, along)/alongLengthSq;
+      if(position < 0.03 || position > 0.97)
         continue;
       sumX += point.x;      sumY += point.y;
       sumXX += real(point.x)*point.x;
@@ -257,17 +407,21 @@ static bool refineLine(const std::vector<EdgePoint>& edgePoints, HoughLine& line
     //  y-on-x fit, because the page edges can be near vertical
     real axisAngle = 0.5*std::atan2(2*covXY, varX - varY);
     real fitNormalX = -std::sin(axisAngle), fitNormalY = std::cos(axisAngle);
+    // the axis has no sign; keep the normal pointing the way the line's did, toward the page
+    if(fitNormalX*normalX + fitNormalY*normalY < 0) {
+      fitNormalX = -fitNormalX;
+      fitNormalY = -fitNormalY;
+    }
     real fitTheta = std::atan2(fitNormalY, fitNormalX)*180/M_PI;
+    if(fitTheta < 0)
+      fitTheta += 360;
     real fitRho = meanX*fitNormalX + meanY*fitNormalY;
-    // keep the same representation as the input, so callers that already normalized theta stay consistent
-    while(fitTheta - fitted.thetaDeg > 90) { fitTheta -= 180;  fitRho = -fitRho; }
-    while(fitted.thetaDeg - fitTheta > 90) { fitTheta += 180;  fitRho = -fitRho; }
     fitted.thetaDeg = float(fitTheta);
     fitted.rho = float(fitRho);
     refined = true;
   }
   // if the fit wandered a long way from where the accumulator put it, it latched onto something else
-  if(!refined || orientationDelta(fitted.thetaDeg, originalTheta) > 10)
+  if(!refined || angleDelta(fitted.thetaDeg, originalTheta) > 5)
     return false;
   line.thetaDeg = fitted.thetaDeg;
   line.rho = fitted.rho;
@@ -283,48 +437,129 @@ static void lineToPoints(const HoughLine& line, Point* onLine, Point* along)
   *along = *onLine + Point(-sinT, cosT)*1000;
 }
 
-// Split the lines into the two families and take the outermost of each.  "Outermost" is measured along
-//  each line's own normal, relative to the image center, so it still works on a page photographed askew.
-static bool pickPageEdges(const std::vector<HoughLine>& lines, int width, int height, HoughLine edges[4])
+static Point intersectLines(const HoughLine& first, const HoughLine& second)
 {
-  real centerX = width/2.0, centerY = height/2.0;
-  bool haveVertical = false, haveHorizontal = false;
-  real minVerticalOffset = 0, maxVerticalOffset = 0, minHorizontalOffset = 0, maxHorizontalOffset = 0;
-  for(size_t ii = 0; ii < lines.size(); ++ii) {
-    HoughLine line = lines[ii];
-    // normalize the near-vertical family to theta in [-45, 45) so that lines at 1 and 179 degrees, which
-    //  are the same orientation, do not end up in opposite halves of the range
-    if(line.thetaDeg >= 135) {
-      line.thetaDeg -= 180;
-      line.rho = -line.rho;
-    }
-    real theta = degToRad(line.thetaDeg);
-    real offset = line.rho - (centerX*std::cos(theta) + centerY*std::sin(theta));
-    bool isVertical = line.thetaDeg < 45;  // a vertical line has a horizontal normal
-    if(isVertical) {
-      if(!haveVertical) {
-        edges[0] = edges[1] = line;
-        minVerticalOffset = maxVerticalOffset = offset;
-        haveVertical = true;
+  Point firstOn, firstAlong, secondOn, secondAlong;
+  lineToPoints(first, &firstOn, &firstAlong);
+  lineToPoints(second, &secondOn, &secondAlong);
+  return lineIntersection(firstOn, firstAlong, secondOn, secondAlong);
+}
+
+// corners TL, TR, BR, BL from left, right, top, bottom lines; false if they do not make a usable quad
+static bool quadFromEdges(const HoughLine& left, const HoughLine& right, const HoughLine& top,
+    const HoughLine& bottom, int width, int height, Point quad[4])
+{
+  quad[0] = intersectLines(left, top);
+  quad[1] = intersectLines(right, top);
+  quad[2] = intersectLines(right, bottom);
+  quad[3] = intersectLines(left, bottom);
+  for(int ii = 0; ii < 4; ++ii) {
+    if(quad[ii].isNaN())
+      return false;
+  }
+  // reject a quad that ran far outside the photo, which means the lines were not really page edges
+  real marginX = width*0.25, marginY = height*0.25;
+  for(int ii = 0; ii < 4; ++ii) {
+    if(quad[ii].x < -marginX || quad[ii].x > width + marginX
+        || quad[ii].y < -marginY || quad[ii].y > height + marginY)
+      return false;
+  }
+  if(!isConvexQuad(quad))
+    return false;
+  // the orientation must be TL, TR, BR, BL: clockwise on screen, i.e. positive cross with y down
+  if(cross(quad[1] - quad[0], quad[2] - quad[1]) <= 0)
+    return false;
+  // shoelace area, as a sanity check that we found the page and not some detail printed on it
+  real area = 0;
+  for(int ii = 0; ii < 4; ++ii)
+    area += cross(quad[ii], quad[(ii + 1) % 4]);
+  return std::abs(area)/2 >= width*height*MIN_AREA_FRACTION;
+}
+
+static real quadArea(const Point quad[4])
+{
+  real area = 0;
+  for(int ii = 0; ii < 4; ++ii)
+    area += cross(quad[ii], quad[(ii + 1) % 4]);
+  return std::abs(area)/2;
+}
+
+// keep the strongest few lines of one family, so combining them stays cheap even on a busy background
+static void keepStrongest(std::vector<HoughLine>& lines)
+{
+  std::sort(lines.begin(), lines.end(), [](const HoughLine& a, const HoughLine& b){ return a.votes > b.votes; });
+  if(lines.size() > size_t(MAX_LINES_PER_FAMILY))
+    lines.resize(MAX_LINES_PER_FAMILY);
+}
+
+// Choose the page outline from the candidate lines.  Every combination of a left, right, top and bottom
+//  line is a candidate quad, scored by how much of each of its four *sides* - the segments between its
+//  corners, not the infinite lines - looks like a page edge.  This replaced picking the outermost line of
+//  each orientation, which is right on a plain dark background and wrong on nearly any real one: a table
+//  edge, a plank seam, a laptop, a tablecloth pattern or a second sheet beyond the page is always further
+//  out than the page, so on real photos the detector returned the clutter.  Lines from the clutter do not
+//  survive the side test: extended to meet them, the page's real edges run through empty table and lose
+//  their support, and the clutter line itself runs on past the corners.
+static bool pickPageQuad(const GreyImage& grey, const GradientImage& gradient,
+    const std::vector<HoughLine>& lines, HoughLine edges[4], Point bestQuad[4])
+{
+  // Families by where the normal - toward the brighter side, so into the page - points: a left edge's
+  //  points right (0 degrees), a top edge's down (90), and so on.
+  std::vector<HoughLine> families[4];  // left, top, right, bottom
+  for(const HoughLine& line : lines) {
+    int family = int(std::floor(std::fmod(line.thetaDeg + 45, 360.0f)/90)) & 3;
+    families[family].push_back(line);
+  }
+  std::vector<LineSupport> supports[4];
+  for(int family = 0; family < 4; ++family) {
+    keepStrongest(families[family]);
+    if(families[family].empty())
+      return false;
+    for(const HoughLine& line : families[family])
+      supports[family].push_back(measureLineSupport(grey, gradient, line));
+  }
+
+  // how far the image center lies on the page side of a line; for two opposite edges, the sum is the
+  //  distance between them, wherever the page is in the frame
+  Point center(grey.width/2.0, grey.height/2.0);
+  auto inwardOffset = [&](const LineSupport& support) { return dot(support.normal, center) - support.line.rho; };
+  real imageArea = real(grey.width)*grey.height;
+  float bestScore = -1;
+  for(const LineSupport& left : supports[0]) {
+    for(const LineSupport& right : supports[2]) {
+      if(inwardOffset(left) + inwardOffset(right) < grey.width*MIN_SEPARATION)
+        continue;
+      for(const LineSupport& top : supports[1]) {
+        for(const LineSupport& bottom : supports[3]) {
+          if(inwardOffset(top) + inwardOffset(bottom) < grey.height*MIN_SEPARATION)
+            continue;
+          Point quad[4];
+          if(!quadFromEdges(left.line, right.line, top.line, bottom.line, grey.width, grey.height, quad))
+            continue;
+          float sides[4] = {
+            sideSupport(left, quad[3], quad[0]),
+            sideSupport(right, quad[1], quad[2]),
+            sideSupport(top, quad[0], quad[1]),
+            sideSupport(bottom, quad[2], quad[3])
+          };
+          float total = 0, weakest = 1;
+          for(float side : sides) {
+            total += side;
+            weakest = std::min(weakest, side);
+          }
+          if(weakest < MIN_SIDE_SUPPORT || total < MIN_TOTAL_SUPPORT)
+            continue;
+          float score = total + AREA_WEIGHT*float(quadArea(quad)/imageArea);
+          if(score > bestScore) {
+            bestScore = score;
+            edges[0] = left.line;  edges[1] = right.line;  edges[2] = top.line;  edges[3] = bottom.line;
+            std::copy(quad, quad + 4, bestQuad);
+          }
+        }
       }
-      else if(offset < minVerticalOffset) { edges[0] = line;  minVerticalOffset = offset; }
-      else if(offset > maxVerticalOffset) { edges[1] = line;  maxVerticalOffset = offset; }
-    }
-    else {
-      if(!haveHorizontal) {
-        edges[2] = edges[3] = line;
-        minHorizontalOffset = maxHorizontalOffset = offset;
-        haveHorizontal = true;
-      }
-      else if(offset < minHorizontalOffset) { edges[2] = line;  minHorizontalOffset = offset; }
-      else if(offset > maxHorizontalOffset) { edges[3] = line;  maxHorizontalOffset = offset; }
     }
   }
-  if(!haveVertical || !haveHorizontal)
-    return false;
-  // if one line was picked as both sides of a pair, we only found one edge of that pair
-  return maxVerticalOffset - minVerticalOffset > width*MIN_SEPARATION
-      && maxHorizontalOffset - minHorizontalOffset > height*MIN_SEPARATION;
+  return bestScore > 0;
 }
 
 void defaultDocumentQuad(int width, int height, real insetFraction, Point quad[4])
@@ -342,45 +577,22 @@ bool detectDocumentQuad(const unsigned int* pixels, int width, int height, Point
     return false;
   GreyImage grey = downscaleToGrey(pixels, width, height);
   blur3x3(grey);
-  std::vector<EdgePoint> edgePoints = findEdgePoints(grey);
+  std::vector<EdgePoint> edgePoints;
+  GradientImage gradient = computeGradients(grey, edgePoints);
   std::vector<HoughLine> lines = findLines(edgePoints, grey.width, grey.height);
   HoughLine edges[4];  // left, right, top, bottom
-  if(!pickPageEdges(lines, grey.width, grey.height, edges))
+  Point coarse[4];
+  if(!pickPageQuad(grey, gradient, lines, edges, coarse))
     return false;
-  for(int ii = 0; ii < 4; ++ii)
-    refineLine(edgePoints, edges[ii]);  // keeps the Hough estimate if the refit is not trustworthy
-
-  Point leftOn, leftAlong, rightOn, rightAlong, topOn, topAlong, bottomOn, bottomAlong;
-  lineToPoints(edges[0], &leftOn, &leftAlong);
-  lineToPoints(edges[1], &rightOn, &rightAlong);
-  lineToPoints(edges[2], &topOn, &topAlong);
-  lineToPoints(edges[3], &bottomOn, &bottomAlong);
-  Point found[4] = {
-    lineIntersection(leftOn, leftAlong, topOn, topAlong),
-    lineIntersection(rightOn, rightAlong, topOn, topAlong),
-    lineIntersection(rightOn, rightAlong, bottomOn, bottomAlong),
-    lineIntersection(leftOn, leftAlong, bottomOn, bottomAlong)
-  };
-  for(int ii = 0; ii < 4; ++ii) {
-    if(found[ii].isNaN())
-      return false;
-  }
-  if(!isConvexQuad(found))
-    return false;
-  // shoelace area, as a sanity check that we found the page and not some detail printed on it
-  real area = 0;
-  for(int ii = 0; ii < 4; ++ii)
-    area += cross(found[ii], found[(ii + 1) % 4]);
-  area = std::abs(area)/2;
-  if(area < grey.width*grey.height*MIN_AREA_FRACTION)
-    return false;
-  // reject a quad that ran far outside the photo, which means the lines were not really page edges
-  real marginX = grey.width*0.25, marginY = grey.height*0.25;
-  for(int ii = 0; ii < 4; ++ii) {
-    if(found[ii].x < -marginX || found[ii].x > grey.width + marginX
-        || found[ii].y < -marginY || found[ii].y > grey.height + marginY)
-      return false;
-  }
+  // refit each side between the corners the coarse lines give it; keeps the Hough estimate if the refit
+  //  is not trustworthy
+  refineLine(edgePoints, edges[0], coarse[3], coarse[0]);
+  refineLine(edgePoints, edges[1], coarse[1], coarse[2]);
+  refineLine(edgePoints, edges[2], coarse[0], coarse[1]);
+  refineLine(edgePoints, edges[3], coarse[2], coarse[3]);
+  Point found[4];
+  if(!quadFromEdges(edges[0], edges[1], edges[2], edges[3], grey.width, grey.height, found))
+    std::copy(coarse, coarse + 4, found);
   // back to source pixels, clamped to the image; the +0.5 puts the sample at its pixel's center
   for(int ii = 0; ii < 4; ++ii) {
     quad[ii].x = std::min(real(width), std::max(real(0), (found[ii].x + 0.5)*grey.scale));
