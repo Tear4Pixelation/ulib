@@ -651,10 +651,25 @@ bool Painter::setAntiAlias(bool antialias)
   return prev;
 }
 
+// Colors reach the backends premultiplied, so multiply is S*D + D*(1 - Sa) and screen is S + D*(1 - S).
+//  Both keep source-over's alpha.  The GL blend for multiply is exact only over an opaque destination (the
+//  full formula has an extra S*(1 - Da) term no blend factor can express) - fine for the screen, which
+//  always has the page under it; the software renderer and the GL framebuffer-fetch shader do the full
+//  formula, so multiply onto a transparent image still shows the source.
 void Painter::setCompOp(CompOp op)
 {
+  currState().compOp = op;
+  // multiply can only darken, so on a dark backdrop it hides what it paints; screen is its mirror image
+  //  (multiply with every color inverted), which lightens a dark backdrop by as much as multiply darkens
+  //  a light one, and leaves light content (e.g. light text on a dark page) as light as it was
+  if(op == CompOp_Multiply && currState().darkBackdrop)
+    op = CompOp_Screen;
   if(op == CompOp_Clear)
     nvgGlobalCompositeBlendFunc(vg, NVG_ZERO, NVG_ZERO);
+  else if(op == CompOp_Multiply)
+    nvgGlobalCompositeBlendFuncSeparate(vg, NVG_DST_COLOR, NVG_ONE_MINUS_SRC_ALPHA, NVG_ONE, NVG_ONE_MINUS_SRC_ALPHA);
+  else if(op == CompOp_Screen)
+    nvgGlobalCompositeBlendFuncSeparate(vg, NVG_ONE, NVG_ONE_MINUS_SRC_COLOR, NVG_ONE, NVG_ONE_MINUS_SRC_ALPHA);
   else if(op < NOT_SUPPORTED)
     nvgGlobalCompositeOperation(vg, op);
 }

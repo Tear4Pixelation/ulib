@@ -117,6 +117,7 @@ public:
     float globalAlpha = 1.0;
     const ColorMap* colorMap = NULL;
     CompOp compOp = CompOp_SrcOver;
+    bool darkBackdrop = false;  // see setDarkBackdrop()
     bool antiAlias = true;
     bool sRGBAdjAlpha = false;
   };
@@ -185,8 +186,13 @@ public:
   void fillRect(Rect rect, Color c);
 
   bool setAntiAlias(bool antialias);
+  // supported: the NVG ops, Clear, Multiply and Screen; others are ignored (drawn source-over)
   void setCompOp(CompOp op);
   CompOp compOp() const { return currState().compOp; }
+  // what is drawn under the content is dark (e.g. a page in night mode): a later Multiply is drawn as
+  //  Screen instead, so it lightens rather than vanishing.  Set before the ops it should affect.
+  void setDarkBackdrop(bool dark) { currState().darkBackdrop = dark; }
+  bool darkBackdrop() const { return currState().darkBackdrop; }
   void setOpacity(real opacity);
   real opacity() const { return currState().globalAlpha; }
 
