@@ -75,6 +75,21 @@ int miniz_go(int level, minigz_in_t istrm, minigz_out_t ostrm, uint32_t* crc_32 
 void gzip_header(minigz_out_t ostrm, uint8_t flags = 0);
 void gzip_footer(minigz_out_t ostrm, int len, uint32_t crc32);
 
+// Memory to memory versions of miniz_go.  miniz_deflate_mem() makes exactly the mz_deflate() calls
+//  miniz_go(level, ...) makes when reading the same bytes from a stream (same input slices, same output
+//  space per call, same flushes), so its output is byte-identical - it just skips the two chunk-sized
+//  bounce buffers and stream callbacks.  Output is appended to *pout (malloc'd, grown with realloc, owned
+//  by the caller: free() it); *poutlen is its length.  Returns bytes consumed (len) or < 0 on error.
+int miniz_deflate_mem(int level, const void* src, size_t len, uint8_t** pout, size_t* poutlen, uint32_t* crc_32 = NULL);
+// inflate a raw deflate stream (e.g. one bgz block) of srclen bytes into *pout (malloc'd, caller frees);
+//  sizehint is the expected output size; stops early once maxlen bytes are out (to peek at the start).
+//  Returns inflated length or < 0 on error.
+long miniz_inflate_mem(const void* src, size_t srclen, size_t sizehint, uint8_t** pout, size_t maxlen = SIZE_MAX);
+// CRC32 of A followed by B given crc(A), crc(B) and len(B) (as zlib's crc32_combine)
+uint32_t miniz_crc32_combine(uint32_t crc1, uint32_t crc2, size_t len2);
+// mz_crc32, without pulling in miniz.h (whose zlib-compatible macros rename deflate, compress, etc.)
+uint32_t miniz_crc32(uint32_t crc, const void* buf, size_t len);
+
 #include <vector>
 
 struct bgz_block_info_t
@@ -96,6 +111,7 @@ bool bgz_read_block(minigz_in_t istrm, bgz_block_info_t* block_info, minigz_out_
 #undef MINIZ_GZ_IMPLEMENTATION
 #include "miniz/miniz.h"
 #include <memory>
+#include <algorithm>
 
 //static constexpr size_t STRM_MAX = std::numeric_limits<std::streamsize>::max();
 static size_t chunkSize = 1 << 20;
@@ -172,6 +188,134 @@ error:
   free(y); free(x);
   level < 0 ? inflateEnd(&s) : deflateEnd(&s);
   return res;
+}
+
+int miniz_deflate_mem(int level, const void* src, size_t len, uint8_t** pout, size_t* poutlen, uint32_t* crc_32)
+{
+  int final_flush = level & MINIZ_GZ_NO_FINISH ? MZ_FULL_FLUSH : MZ_FINISH;
+  level = level & ~MINIZ_GZ_NO_FINISH;
+  if(level < 0) return -1;
+
+  mz_stream s;
+  memset(&s, 0, sizeof(mz_stream));
+  if(deflateInit2(&s, level, MZ_DEFLATED, -MZ_DEFAULT_WINDOW_BITS, 6, MZ_DEFAULT_STRATEGY))
+    return -1;
+  if(crc_32) *crc_32 = mz_crc32(*crc_32, (const uint8_t*)src, len);
+
+  const uint8_t* in = (const uint8_t*)src;
+  size_t pos = 0, outlen = *poutlen, outcap = outlen;
+  uint8_t* out = *pout;
+  int res = -1;
+  // the loop of miniz_go() with istrm.read() replaced by slicing src and ostrm.write() by writing in place
+  size_t n = 0, nreq = chunkSize;
+  for(;;) {
+    if(s.avail_in == 0) {
+      n = std::min(nreq, len - pos);
+      s.next_in = in + pos;
+      s.avail_in = n;
+      pos += n;
+    }
+    if(outcap - outlen < chunkSize) {
+      outcap = std::max(outlen + chunkSize, outcap + outcap/2);
+      uint8_t* grown = (uint8_t*)realloc(out, outcap);
+      if(!grown) { res = -1; break; }
+      out = grown;
+    }
+    s.next_out = out + outlen;
+    s.avail_out = chunkSize;
+    res = mz_deflate(&s, n < nreq ? final_flush : MZ_NO_FLUSH);
+    if(res == MZ_STREAM_END || res == MZ_OK) {
+      outlen += chunkSize - s.avail_out;
+      if(res == MZ_STREAM_END || (n < nreq && s.avail_out > 0)) { res = s.total_in; break; }
+    }
+    else if(res == MZ_BUF_ERROR) {
+      if(n == 0 && s.avail_out > 0) { res = s.total_in; break; }
+    }
+    else { res = -1; break; }
+  }
+  deflateEnd(&s);
+  *pout = out;
+  *poutlen = outlen;
+  return res;
+}
+
+long miniz_inflate_mem(const void* src, size_t srclen, size_t sizehint, uint8_t** pout, size_t maxlen)
+{
+  mz_stream s;
+  memset(&s, 0, sizeof(mz_stream));
+  if(inflateInit2(&s, -MZ_DEFAULT_WINDOW_BITS))
+    return -1;
+  // +1 so an exact hint does not need a regrow just to see the end of input
+  size_t outcap = std::max(sizehint + 1, size_t(4096)), outlen = 0;
+  uint8_t* out = (uint8_t*)malloc(outcap);
+  long res = -1;
+  s.next_in = (const uint8_t*)src;
+  s.avail_in = srclen;
+  while(out) {
+    if(outlen == outcap) {
+      outcap += outcap/2;
+      uint8_t* grown = (uint8_t*)realloc(out, outcap);
+      if(!grown) break;
+      out = grown;
+    }
+    s.next_out = out + outlen;
+    s.avail_out = outcap - outlen;
+    int status = mz_inflate(&s, MZ_SYNC_FLUSH);
+    outlen = s.total_out;
+    if(outlen >= maxlen && status != MZ_DATA_ERROR) {
+      res = long(outlen);
+      break;
+    }
+    // as in miniz_go: MZ_OK can still leave output pending, so keep going until no progress is possible
+    //  (a bgz block is flushed, not finished, so the end of input shows up as MZ_BUF_ERROR)
+    if(status == MZ_STREAM_END || (status == MZ_BUF_ERROR && s.avail_in == 0 && s.avail_out > 0)) {
+      res = long(outlen);
+      break;
+    }
+    if(status != MZ_OK && !(status == MZ_BUF_ERROR && s.avail_out == 0))
+      break;
+  }
+  inflateEnd(&s);
+  if(res < 0) { free(out); out = NULL; }
+  *pout = out;
+  return res;
+}
+
+uint32_t miniz_crc32(uint32_t crc, const void* buf, size_t len)
+{
+  return uint32_t(mz_crc32(crc, (const uint8_t*)buf, len));
+}
+
+// GF(2) polynomial arithmetic for combining CRCs, as in zlib 1.2.12+ crc32.c
+static uint32_t gz_multmodp(uint32_t a, uint32_t b)
+{
+  uint32_t m = uint32_t(1) << 31, p = 0;
+  for(;;) {
+    if(a & m) {
+      p ^= b;
+      if((a & (m - 1)) == 0)
+        break;
+    }
+    m >>= 1;
+    b = b & 1 ? (b >> 1) ^ 0xEDB88320 : b >> 1;
+  }
+  return p;
+}
+
+uint32_t miniz_crc32_combine(uint32_t crc1, uint32_t crc2, size_t len2)
+{
+  // x2n[k] = x^(2^k) mod p(x); built once (thread-safe static init)
+  struct X2nTable { uint32_t t[32]; X2nTable() { uint32_t p = uint32_t(1) << 30; t[0] = p;
+      for(int k = 1; k < 32; ++k) t[k] = p = gz_multmodp(p, p); } };
+  static const X2nTable x2n;
+  // x^(8*len2) mod p(x)
+  uint32_t op = uint32_t(1) << 31;
+  unsigned int k = 3;
+  for(size_t n = len2; n; n >>= 1, ++k) {
+    if(n & 1)
+      op = gz_multmodp(x2n.t[k & 31], op);
+  }
+  return gz_multmodp(op, crc1) ^ crc2;
 }
 
 static void storLE32(uint8_t *p, uint32_t n)
