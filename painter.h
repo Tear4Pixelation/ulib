@@ -3,6 +3,7 @@
 #include <vector>
 #include <string>
 #include <utility>
+#include <unordered_map>
 #include "geom.h"
 #include "color.h"
 #include "nanovg.h"
@@ -131,9 +132,17 @@ public:
   NVGSWUblitter* swBlitter = NULL;
   NVGcontext* vg = NULL;
   int createFlags = 0;
-  // members for keeping track of and clearing GL textures for images
+  // textures the caching painter keeps for Images, by nanovg handle (handles are never reused), evicted least
+  //  recently used first once cachedBytes passes maxCachedBytes - but never one drawn in the last few frames,
+  //  so a working set larger than the cap stays put instead of being uploaded again every frame
+  struct CachedImage { int bytes; unsigned int lastFrame; };
+  std::unordered_map<int, CachedImage> imgCache;
   int cachedBytes = 0;
-  std::vector<int> imgHandles;
+  unsigned int frameCount = 0;
+  // draw an image much larger than its destination from a smaller copy made once (and kept, encoded) - for
+  //  small software renders (page thumbnails): decoding a page scan at full size was most of their cost.
+  //  Never set for exports or Image::scaled(), whose output must not change.
+  bool useImageProxies = false;
 
   enum CreateFlags { PAINT_NULL = 0, PAINT_SW = 1, PAINT_GL = 2, /*PAINT_VTEX = 3,*/ PAINT_MASK = 3,
       PRIVATE_FONTS = 1<<2, NO_TEXT = 1<<3, MULTITHREAD = 1<<4, SRGB_AWARE = 1<<5, SW_NO_XC = 1<<6,
@@ -256,6 +265,8 @@ public:
 
   // static methods
   static void invalidateImage(int handle, int len);
+  // evict cached textures not drawn in the last few frames until no more than maxBytes are held
+  void trimImageCache(int maxBytes);
   static void initFontStash(int flags, int pad = 4, float pixdist = 32.0f);
   static bool loadFont(const char* name, const char* filename, Painter* painter = NULL);
   static bool loadFontMem(const char* name, unsigned char* data, int len, Painter* painter = NULL);

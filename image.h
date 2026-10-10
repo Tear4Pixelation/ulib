@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 #include <vector>
 #include "geom.h"
 
@@ -21,6 +22,10 @@ public:
   mutable int mappedHandle = -1;
   mutable int mappedKey = 0;
   static constexpr int UNMAPPED = -2;
+  // identifies the pixels: every constructor and invalidate() take a new, never reused id and a move carries
+  //  it along, so something derived from the image (a scaled save, a thumbnail proxy) can be cached against
+  //  it - pixels changed in place must be followed by invalidate(), as the texture cache already requires
+  uint64_t contentId;
 
   Image(int w, int h, Encoding imgfmt = UNKNOWN);
   Image(Image&& other);
@@ -68,6 +73,8 @@ public:
   static Image fromPixelsNoCopy(int w, int h, unsigned char* d, Encoding imgfmt = UNKNOWN);
 protected:
   Image(int w, int h, unsigned char* d, Encoding imgfmt, EncodeBuff encdata = EncodeBuff())
-      : width(w), height(h), data(d), encData(encdata), encoding(imgfmt), painterHandle(-1) {}
+      : width(w), height(h), data(d), encData(encdata), encoding(imgfmt), painterHandle(-1),
+        contentId(newContentId()) {}
+  static uint64_t newContentId();
   Image(const Image& other);
 };

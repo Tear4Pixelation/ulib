@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <utility>
+#include <atomic>
 #include "image.h"
 #include "painter.h"
 
@@ -34,10 +35,17 @@ Image::Image(int w, int h, Encoding imgfmt) : Image(w, h, NULL, imgfmt)
     data = (unsigned char*)calloc(w*h, 4);
 }
 
+uint64_t Image::newContentId()
+{
+  static std::atomic<uint64_t> lastId(0);
+  return ++lastId;
+}
+
 Image::Image(Image&& other) : width(std::exchange(other.width, 0)), height(std::exchange(other.height, 0)),
     data(std::exchange(other.data, nullptr)), encData(std::move(other.encData)),
     encoding(other.encoding), painterHandle(std::exchange(other.painterHandle, -1)),
-    mappedHandle(std::exchange(other.mappedHandle, -1)), mappedKey(std::exchange(other.mappedKey, 0)) {}
+    mappedHandle(std::exchange(other.mappedHandle, -1)), mappedKey(std::exchange(other.mappedKey, 0)),
+    contentId(std::exchange(other.contentId, newContentId())) {}
 
 Image& Image::operator=(Image&& other)
 {
@@ -49,13 +57,14 @@ Image& Image::operator=(Image&& other)
   std::swap(painterHandle, other.painterHandle);
   std::swap(mappedHandle, other.mappedHandle);
   std::swap(mappedKey, other.mappedKey);
+  std::swap(contentId, other.contentId);
   return *this;
 }
 
 // we've switched from vector to plain pointer for data since that's what stb_image's load fns return
 // we can't copy painterHandle ... TODO: could use something like clone_ptr here instead
 Image::Image(const Image& other) : width(other.width), height(other.height), data(NULL),
-   encData(other.encData), encoding(other.encoding), painterHandle(-1)
+   encData(other.encData), encoding(other.encoding), painterHandle(-1), contentId(newContentId())
 {
   int n = width*height*4;
   if(other.data) {
@@ -86,6 +95,7 @@ Image::~Image()
 
 void Image::invalidate()
 {
+  contentId = newContentId();
   encData.clear();
   Painter::invalidateImage(painterHandle, dataLen());
   painterHandle = -1;
@@ -125,13 +135,20 @@ Image Image::cropped(const Rect& src) const
   int outh = std::min(int(src.bottom), height) - int(src.top);
   if(outw <= 0 || outh <= 0)
     return Image(0, 0);
+  // an encoded-only image (a page scan) is decoded for the crop and stays encoded: constPixels() would
+  //  have kept the full decoded image (~35 MB for an A4 scan at 300 DPI) for good, e.g. after every save
+  unsigned char* bytes = bytesOnce();
+  if(!bytes)
+    return Image(0, 0);
   Image out(outw, outh, encoding);
-  const unsigned int* srcpix = constPixels() + int(src.top)*width + int(src.left);
+  const unsigned int* srcpix = (const unsigned int*)bytes + int(src.top)*width + int(src.left);
   unsigned int* dstpix = out.pixels();
   for(int y = 0; y < out.height; ++y) {
     for(int x = 0; x < out.width; ++x)
       dstpix[y*out.width + x] = srcpix[y*width + x];
   }
+  if(bytes != data)
+    free(bytes);
   return out;
 }
 
