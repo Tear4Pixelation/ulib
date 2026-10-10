@@ -175,13 +175,10 @@ void Painter::beginFrame(real pxRatio)
   ASSERT(deviceRect.isValid());
   int fbWidth = deviceRect.width(), fbHeight = deviceRect.height();
 
-  // clearing textures added to support Write documents w/ large number of images (e.g. from PDF conversion)
-  if(cachedBytes > maxCachedBytes) {
-    for(int h : imgHandles)
-      nvgDeleteImage(vg, h);
-    imgHandles.clear();
-    cachedBytes = 0;
-  }
+  // evicting textures added to support Write documents w/ large number of images (e.g. from PDF conversion)
+  ++frameCount;
+  if(cachedBytes > maxCachedBytes)
+    trimImageCache(maxCachedBytes);
 
 #ifndef NO_PAINTER_SW
   if(swBlitter) {
@@ -461,8 +458,151 @@ void Painter::fillRect(Rect rect, Color c)
   setFillBrush(currState().fillBrush); // restore brush
 }
 
+// Image proxies (Painter::useImageProxies): a page thumbnail drew each page scan from its full size JPEG -
+//  decoded, then copied into a fresh software painter - for a destination a tenth of its size.  The proxy is
+//  a box filtered copy 2-4 times the destination's size, made once per image (by Image::contentId, so an
+//  edited image gets a new one) and kept encoded, least recently used dropped past MAX_PROXY_BYTES.
+struct ImageProxy { int factor; Image::EncodeBuff enc; unsigned int lastUse; };
+static std::mutex proxyMutex;
+static std::unordered_map<uint64_t, ImageProxy> imageProxies;
+static size_t proxyBytes = 0;
+static unsigned int proxyUseCount = 0;
+static constexpr size_t MAX_PROXY_BYTES = 16 << 20;
+
+// average each factor x factor block (alpha weighted); the last row and column may be partial blocks
+static Image boxDownscale(const unsigned char* px, int w, int h, int factor, Image::Encoding encoding)
+{
+  int outw = (w + factor - 1)/factor, outh = (h + factor - 1)/factor;
+  Image out(outw, outh, encoding);
+  unsigned char* dst = out.bytes();
+  std::vector<uint64_t> sums(size_t(outw)*4);
+  std::vector<uint32_t> counts(outw);
+  for(int oy = 0; oy < outh; ++oy) {
+    std::fill(sums.begin(), sums.end(), 0);
+    std::fill(counts.begin(), counts.end(), 0);
+    int yend = std::min(h, (oy + 1)*factor);
+    for(int y = oy*factor; y < yend; ++y) {
+      const unsigned char* row = px + size_t(y)*w*4;
+      for(int ox = 0; ox < outw; ++ox) {
+        int xend = std::min(w, (ox + 1)*factor);
+        uint64_t red = 0, green = 0, blue = 0, alphaSum = 0;
+        for(int x = ox*factor; x < xend; ++x) {
+          const unsigned char* pixel = row + 4*x;
+          uint32_t alpha = pixel[3];
+          red += pixel[0]*alpha;  green += pixel[1]*alpha;  blue += pixel[2]*alpha;  alphaSum += alpha;
+        }
+        uint64_t* sum = &sums[4*ox];
+        sum[0] += red;  sum[1] += green;  sum[2] += blue;  sum[3] += alphaSum;
+        counts[ox] += xend - ox*factor;
+      }
+    }
+    unsigned char* outrow = dst + size_t(oy)*outw*4;
+    for(int ox = 0; ox < outw; ++ox) {
+      const uint64_t* sum = &sums[4*ox];
+      unsigned char* pixel = outrow + 4*ox;
+      if(sum[3] == 0) {
+        pixel[0] = pixel[1] = pixel[2] = pixel[3] = 0;
+        continue;
+      }
+      for(int channel = 0; channel < 3; ++channel)
+        pixel[channel] = (unsigned char)((sum[channel] + sum[3]/2)/sum[3]);
+      pixel[3] = (unsigned char)((sum[3] + counts[ox]/2)/counts[ox]);
+    }
+  }
+  return out;
+}
+
+// draws image from its proxy if it is big and drawn much smaller; false to draw it as usual
+static bool drawImageProxy(Painter* painter, const Rect& dest, const Image& image, Rect src, int flags)
+{
+  if(image.isNull() || int64_t(image.width)*image.height < (1 << 20))
+    return false;
+  if(!src.isValid())
+    src = Rect::ltwh(0, 0, image.width, image.height);
+  Transform2D tf = painter->getTransform();
+  real devw = std::abs(dest.width())*std::sqrt(tf.m[0]*tf.m[0] + tf.m[1]*tf.m[1]);
+  real devh = std::abs(dest.height())*std::sqrt(tf.m[2]*tf.m[2] + tf.m[3]*tf.m[3]);
+  if(devw <= 0 || devh <= 0)
+    return false;
+  // image pixels per device pixel
+  real ratio = std::min(src.width()/devw, src.height()/devh);
+  if(ratio < 4)
+    return false;
+  int factor = int(ratio/2);
+  Image::EncodeBuff enc;
+  int proxyFactor = 0;
+  {
+    std::lock_guard<std::mutex> lock(proxyMutex);
+    auto it = imageProxies.find(image.contentId);
+    // a proxy with more detail than needed will do; one with less is made again
+    if(it != imageProxies.end() && it->second.factor <= factor) {
+      it->second.lastUse = ++proxyUseCount;
+      enc = it->second.enc;
+      proxyFactor = it->second.factor;
+    }
+  }
+  if(!proxyFactor) {
+    unsigned char* bytes = image.bytesOnce();
+    if(!bytes)
+      return false;
+    Image small = boxDownscale(bytes, image.width, image.height, factor, image.encoding);
+    bool jpeg = image.encoding == Image::JPEG && !image.hasTransparency();
+    if(bytes != image.data) free(bytes);
+    enc = jpeg ? small.encodeJPEG(90) : small.encodePNG();
+    if(enc.empty())
+      return false;
+    proxyFactor = factor;
+    std::lock_guard<std::mutex> lock(proxyMutex);
+    ImageProxy& proxy = imageProxies[image.contentId];
+    proxyBytes += enc.size();
+    proxyBytes -= proxy.enc.size();
+    proxy = ImageProxy{factor, enc, ++proxyUseCount};
+    while(proxyBytes > MAX_PROXY_BYTES && imageProxies.size() > 1) {
+      auto oldest = imageProxies.begin();
+      for(auto entry = imageProxies.begin(); entry != imageProxies.end(); ++entry) {
+        if(entry->second.lastUse < oldest->second.lastUse)
+          oldest = entry;
+      }
+      proxyBytes -= oldest->second.enc.size();
+      imageProxies.erase(oldest);
+    }
+  }
+  // always drawn from the encoded proxy, so a thumbnail does not depend on whether the proxy was just made
+  Image proxyImg = Image::decodeBuffer(enc.data(), enc.size());
+  Rect proxySrc = Rect::ltrb(src.left/proxyFactor, src.top/proxyFactor, src.right/proxyFactor, src.bottom/proxyFactor);
+  painter->useImageProxies = false;
+  painter->drawImage(dest, proxyImg, proxySrc, flags);
+  painter->useImageProxies = true;
+  return true;
+}
+
+// frames a texture stays cached after it was last drawn, however full the cache is
+static constexpr unsigned int KEEP_RECENT_FRAMES = 8;
+
+void Painter::trimImageCache(int maxBytes)
+{
+  if(cachedBytes <= maxBytes)
+    return;
+  std::vector<std::pair<unsigned int, int>> byAge;  // (last frame drawn, handle)
+  for(auto& entry : imgCache) {
+    if(frameCount - entry.second.lastFrame > KEEP_RECENT_FRAMES)
+      byAge.emplace_back(entry.second.lastFrame, entry.first);
+  }
+  std::sort(byAge.begin(), byAge.end());
+  for(auto& item : byAge) {
+    if(cachedBytes <= maxBytes)
+      break;
+    auto it = imgCache.find(item.second);
+    cachedBytes -= it->second.bytes;
+    imgCache.erase(it);
+    nvgDeleteImage(vg, item.second);
+  }
+}
+
 void Painter::drawImage(const Rect& dest, const Image& image, Rect src, int flags)
 {
+  if(useImageProxies && this != cachingPainter && drawImageProxy(this, dest, image, src, flags))
+    return;
   // night mode: the map may want a rewritten copy of this image - unless it already declined this one
   const ColorMap* colorMap = currState().colorMap;
   int mapKey = colorMap ? colorMap->imageKey() : 0;
@@ -470,10 +610,12 @@ void Painter::drawImage(const Rect& dest, const Image& image, Rect src, int flag
     mapKey = 0;
   int cachedHandle = !mapKey ? image.painterHandle : image.mappedKey == mapKey ? image.mappedHandle : -1;
 
-  // we are using the fact that a nanovg instance assigns monotonically increasing image (texture) handles
   int handle;
-  if(this == cachingPainter && !imgHandles.empty() && cachedHandle >= imgHandles.front())
+  auto cached = this == cachingPainter && cachedHandle >= 0 ? imgCache.find(cachedHandle) : imgCache.end();
+  if(cached != imgCache.end()) {
     handle = cachedHandle;
+    cached->second.lastFrame = frameCount;
+  }
   else {
     //flags |= NVG_IMAGE_GENERATE_MIPMAPS; ... just seemed to make things more blurry
     flags |= sRGB() ? NVG_IMAGE_SRGB : 0;
@@ -491,8 +633,12 @@ void Painter::drawImage(const Rect& dest, const Image& image, Rect src, int flag
         mapKey = 0;
       }
     }
-    bool reuse = !mapKey && this == cachingPainter && !imgHandles.empty()
-        && image.painterHandle >= imgHandles.front();  // declined, and the plain texture is cached
+    // declined, and the plain texture is cached
+    auto plain = !mapKey && this == cachingPainter && image.painterHandle >= 0 ?
+        imgCache.find(image.painterHandle) : imgCache.end();
+    bool reuse = plain != imgCache.end();
+    if(reuse)
+      plain->second.lastFrame = frameCount;
     handle = reuse ? image.painterHandle
         : nvgCreateImageRGBA(vg, image.width, image.height, flags, bytes);
     if(bytes != image.data) free(bytes);
@@ -505,7 +651,7 @@ void Painter::drawImage(const Rect& dest, const Image& image, Rect src, int flag
       }
       else
         image.painterHandle = handle;
-      imgHandles.push_back(handle);
+      imgCache[handle] = CachedImage{image.dataLen(), frameCount};
       cachedBytes += image.dataLen();
     }
   }
@@ -526,8 +672,13 @@ void Painter::drawImage(const Rect& dest, const Image& image, Rect src, int flag
 
 void Painter::invalidateImage(int handle, int len)
 {
-  if(cachingPainter && !cachingPainter->imgHandles.empty() && handle >= cachingPainter->imgHandles.front()) {
-    cachingPainter->cachedBytes -= len;
+  // an image never drawn by the caching painter (handle -1) must not touch its cache: it may be on a thread
+  if(handle < 0 || !cachingPainter)
+    return;
+  auto it = cachingPainter->imgCache.find(handle);
+  if(it != cachingPainter->imgCache.end()) {
+    cachingPainter->cachedBytes -= it->second.bytes;
+    cachingPainter->imgCache.erase(it);
     nvgDeleteImage(cachingPainter->vg, handle);
   }
 }
