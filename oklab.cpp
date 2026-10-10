@@ -103,46 +103,49 @@ real oklchMaxChroma(real L, real hue)
 //  is accurate to ~1e-4, far below a displayable difference.  Interpolating (rather than rounding to the
 //  nearest degree) matters because jitter puts family hues at fractional angles, and rounding would make
 //  two hues a fraction of a degree apart share a cusp and so land on visibly different chroma.
-struct CuspTable
+//
+// The app reads the table as a literal (oklab_cusptable.inc): building it costs ~1.1M gamut tests
+//  (~50 ms, a fifth of startup) and it never changes.  oklchBuildCuspTable() below is the builder that
+//  generated the literal, kept unchanged as the reference: colortest rebuilds the table with it and
+//  compares bit for bit, since cusp-walk-1 is frozen.  The literal is printed with %.17g, which
+//  round-trips every double exactly (C++14 has no hex float literals).  Never edit the .inc by hand;
+//  regenerate it with ./colortest --dump-cusp if the builder ever legitimately changes (which would be a
+//  new generator id, see docs/agent/themes.md).
+void oklchBuildCuspTable(real* L, real* C)
 {
-  real L[360];
-  real C[360];
-
-  CuspTable()
-  {
-    for(int deg = 0; deg < 360; ++deg) {
-      real bestL = real(0.5), bestC = -1;
-      for(real l = real(0.05); l <= real(0.98); l += real(0.01)) {
-        real c = oklchMaxChroma(l, real(deg));
-        if(c > bestC) { bestC = c; bestL = l; }
-      }
-      // refine around the coarse peak
-      real lo = std::max(real(0.02), bestL - real(0.012));
-      real hi = std::min(real(0.995), bestL + real(0.012));
-      for(real l = lo; l <= hi; l += real(0.0015)) {
-        real c = oklchMaxChroma(l, real(deg));
-        if(c > bestC) { bestC = c; bestL = l; }
-      }
-      L[deg] = bestL;
-      C[deg] = bestC;
+  for(int deg = 0; deg < 360; ++deg) {
+    real bestL = real(0.5), bestC = -1;
+    for(real l = real(0.05); l <= real(0.98); l += real(0.01)) {
+      real c = oklchMaxChroma(l, real(deg));
+      if(c > bestC) { bestC = c; bestL = l; }
     }
+    // refine around the coarse peak
+    real lo = std::max(real(0.02), bestL - real(0.012));
+    real hi = std::min(real(0.995), bestL + real(0.012));
+    for(real l = lo; l <= hi; l += real(0.0015)) {
+      real c = oklchMaxChroma(l, real(deg));
+      if(c > bestC) { bestC = c; bestL = l; }
+    }
+    L[deg] = bestL;
+    C[deg] = bestC;
   }
-};
+}
+
+// defines oklchCuspTableL[360] and oklchCuspTableC[360]
+#include "oklab_cusptable.inc"
 
 ColorOkLch oklchCusp(real hue)
 {
-  // function-local static: C++11 guarantees this is initialized exactly once and is thread safe, which
-  //  matters because palettes can be generated from the document-load thread
-  static const CuspTable table;
-
+  const real* tableL = oklchCuspTableL;
+  const real* tableC = oklchCuspTableC;
   hue = oklchWrapHue(hue);
   int lo = int(hue);
   if(lo < 0) lo = 0;
   if(lo > 359) lo = 359;
   int hi = (lo + 1) % 360;
   real f = hue - real(lo);
-  return ColorOkLch(table.L[lo] + f*(table.L[hi] - table.L[lo]),
-                    table.C[lo] + f*(table.C[hi] - table.C[lo]), hue);
+  return ColorOkLch(tableL[lo] + f*(tableL[hi] - tableL[lo]),
+                    tableC[lo] + f*(tableC[hi] - tableC[lo]), hue);
 }
 
 // --- distance and contrast -------------------------------------------------------------------------
