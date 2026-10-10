@@ -1,6 +1,7 @@
 #include <string.h>
 #include <mutex>
 #include <memory>
+#include <type_traits>
 
 #include "platformutil.h"
 #include "painter.h"
@@ -388,7 +389,8 @@ void Painter::beginPath()
 
 void Painter::endPath()
 {
-  if(!currState().fillBrush.isNone())
+  bool fill = !currState().fillBrush.isNone();
+  if(fill && !currState().strokeUnderFill)
     nvgFill(vg);
   if(!currState().strokeBrush.isNone()) {
     // compensate for multiplication by scale done in nvgStroke() ... w/ nanovg-2 we can now just pass width = 0
@@ -398,6 +400,9 @@ void Painter::endPath()
     if(currState().strokeEffect == NonScalingStroke)
       nvgStrokeWidth(vg, currState().strokeWidth);  // restore
   }
+  // nvgStroke restores the flattened path, so the fill reuses it (see setStrokeUnderFill())
+  if(fill && currState().strokeUnderFill)
+    nvgFill(vg);
 }
 
 // TODO: can we decouple Painter and Path better?
@@ -405,11 +410,24 @@ void Painter::drawPath(const Path2D& path)
 {
   nvgFillRule(vg, path.fillRule == Path2D::EvenOddFill ? NVG_EVENODD : NVG_NONZERO);
   beginPath();
-  for(int ii = 0; ii < path.size(); ++ii) {
-    if(path.command(ii) == Path2D::MoveTo)
-      nvgMoveTo(vg, path.point(ii).x, path.point(ii).y);
-    else if(path.command(ii) == Path2D::LineTo)
-      nvgLineTo(vg, path.point(ii).x, path.point(ii).y);
+  static_assert(sizeof(Point) == 2*sizeof(double) && std::is_same<real, double>::value, "nvgPolylined needs packed double points");
+  int npts = path.size();
+  if(path.isSimple()) {
+    // no commands: move-to then line-tos (see Path2D::command()) - one bulk append
+    if(npts > 0)
+      nvgPolylined(vg, &path.points[0].x, npts, 1);
+    npts = 0;
+  }
+  for(int ii = 0; ii < npts; ++ii) {
+    Path2D::PathCommand cmd = path.command(ii);
+    if(cmd == Path2D::MoveTo || cmd == Path2D::LineTo) {
+      // bulk append the run of line-tos (and the move-to that starts it); ~100 Ir/point cheaper than
+      //  nvgMoveTo/nvgLineTo per point, same commands
+      int jj = ii + 1;
+      while(jj < npts && path.command(jj) == Path2D::LineTo) ++jj;
+      nvgPolylined(vg, &path.points[ii].x, jj - ii, cmd == Path2D::MoveTo);
+      ii = jj - 1;
+    }
     else if(path.command(ii) == Path2D::CubicTo) {
       nvgBezierTo(vg, path.point(ii).x, path.point(ii).y,
           path.point(ii+1).x, path.point(ii+1).y, path.point(ii+2).x, path.point(ii+2).y);
