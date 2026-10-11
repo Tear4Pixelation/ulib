@@ -683,6 +683,16 @@ void Painter::invalidateImage(int handle, int len)
   }
 }
 
+bool Painter::isImageCached(const Image& image)
+{
+  Painter* cache = cachingPainter;
+  if(!cache)
+    return false;
+  // imgCache is keyed by texture handle (LRU eviction, so handles are not a contiguous range)
+  return (image.painterHandle >= 0 && cache->imgCache.count(image.painterHandle))
+      || (image.mappedHandle >= 0 && cache->imgCache.count(image.mappedHandle));
+}
+
 void Painter::setAtlasTextThreshold(float thresh)
 {
   atlasTextThresh = thresh;
