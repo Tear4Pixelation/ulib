@@ -24,7 +24,16 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
 #include <utility>
+#include <memory>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <thread>
+#include <chrono>
+#include <algorithm>
 #include "image.h"
 #include "painter.h"
 
@@ -86,6 +95,7 @@ Image::~Image()
 
 void Image::invalidate()
 {
+  dropPrefetch();
   encData.clear();
   Painter::invalidateImage(painterHandle, dataLen());
   painterHandle = -1;
@@ -213,10 +223,187 @@ bool Image::hasTransparency() const
 //#define STB_IMAGE_IMPLEMENTATION -- we expect this to be done somewhere else
 #include "stb_image.h"
 
+// Decoding ahead (prefetchDecode): one worker thread decodes a copy of an image's encoded bytes - a copy,
+//  because the Image may be destroyed or moved meanwhile - and bytesOnce() collects the pixels.  Jobs are
+//  keyed by the address of the Image's encoded buffer, which a move keeps; invalidate() (so the destructor
+//  too) drops the job before the buffer can be freed or reused, so a key never outlives its bytes.
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+#define IMAGE_NO_THREADS 1
+#endif
+
+namespace {
+
+struct DecodeJob {
+  enum State { QUEUED, RUNNING, DONE, CANCELLED };
+  const unsigned char* key;
+  size_t keyLen;
+  Image::EncodeBuff input;
+  unsigned char* pixels = NULL;
+  State state = QUEUED;
+  std::chrono::steady_clock::time_point started;
+  bool orphaned = false;  // dropped while running: the worker frees what it made
+};
+
+struct DecodeAhead {
+  static constexpr size_t MAX_JOBS = 2;  // the pages either side of the view; ~35 MB each at 300 DPI
+  std::mutex mutex;
+  std::condition_variable wake;  // worker: a job was queued
+  std::condition_variable done;  // bytesOnce(): a running job finished
+  std::vector< std::shared_ptr<DecodeJob> > jobs;  // registered, oldest first
+  std::deque< std::shared_ptr<DecodeJob> > queue;
+  bool started = false;
+
+  std::vector< std::shared_ptr<DecodeJob> >::iterator find(const unsigned char* key, size_t len)
+  {
+    return std::find_if(jobs.begin(), jobs.end(),
+        [&](const std::shared_ptr<DecodeJob>& job) { return job->key == key && job->keyLen == len; });
+  }
+
+  // with the lock held: forget a registered job, freeing or cancelling what it holds
+  void release(std::vector< std::shared_ptr<DecodeJob> >::iterator it)
+  {
+    DecodeJob* job = it->get();
+    if(job->state == DecodeJob::DONE)
+      free(job->pixels);
+    else if(job->state == DecodeJob::RUNNING)
+      job->orphaned = true;
+    else
+      job->state = DecodeJob::CANCELLED;  // still queued: the worker skips it
+    job->pixels = NULL;
+    jobs.erase(it);
+    --registered;
+  }
+
+  void run()
+  {
+    for(;;) {
+      std::shared_ptr<DecodeJob> job;
+      {
+        std::unique_lock<std::mutex> lock(mutex);
+        wake.wait(lock, [this](){ return !queue.empty(); });
+        job = std::move(queue.front());
+        queue.pop_front();
+        if(job->state == DecodeJob::CANCELLED)
+          continue;
+        job->state = DecodeJob::RUNNING;
+        job->started = std::chrono::steady_clock::now();
+      }
+      int w = 0, h = 0;
+      unsigned char* pixels = stbi_load_from_memory(job->input.data(), int(job->input.size()), &w, &h, NULL, 4);
+      Image::EncodeBuff().swap(job->input);
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        job->state = DecodeJob::DONE;
+        addSample(workerMsPerMpx, std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - job->started).count(), double(w)*h/1E6);
+        if(job->orphaned)
+          free(pixels);
+        else
+          job->pixels = pixels;
+      }
+      done.notify_all();
+    }
+  }
+
+  std::atomic<int> registered{0};  // jobs.size(), readable without the lock
+
+  // Smoothed decode cost, ms per megapixel, on the worker and on the drawing thread; 0 until measured.
+  //  When the page is needed while its decode is still running, waiting can be slower than decoding it
+  //  right there - the worker started a frame ago and shares the CPU with the frames being drawn (a fast
+  //  fling): bytesOnce() then decodes it itself.
+  double workerMsPerMpx = 0;
+  double localMsPerMpx = 0;
+  static void addSample(double& average, double ms, double mpx)
+  {
+    if(mpx > 0) average = average > 0 ? 0.7*average + 0.3*ms/mpx : ms/mpx;
+  }
+};
+
+// never destroyed: the worker thread runs until the process ends
+DecodeAhead* decodeAhead() { static DecodeAhead* instance = new DecodeAhead; return instance; }
+
+}  // namespace
+
+bool Image::prefetchDecode() const
+{
+#ifdef IMAGE_NO_THREADS
+  return false;
+#else
+  if(data || encData.empty()) return false;
+  DecodeAhead* ahead = decodeAhead();
+  std::lock_guard<std::mutex> lock(ahead->mutex);
+  if(ahead->find(encData.data(), encData.size()) != ahead->jobs.end())
+    return true;
+  if(ahead->jobs.size() >= DecodeAhead::MAX_JOBS)
+    ahead->release(ahead->jobs.begin());
+  auto job = std::make_shared<DecodeJob>();
+  job->key = encData.data();
+  job->keyLen = encData.size();
+  job->input = encData;
+  ahead->jobs.push_back(job);
+  ++ahead->registered;
+  ahead->queue.push_back(std::move(job));
+  if(!ahead->started) {
+    ahead->started = true;
+    std::thread([ahead](){ ahead->run(); }).detach();
+  }
+  ahead->wake.notify_one();
+  return true;
+#endif
+}
+
+void Image::dropPrefetch() const
+{
+#ifndef IMAGE_NO_THREADS
+  if(encData.empty()) return;
+  DecodeAhead* ahead = decodeAhead();
+  if(ahead->registered.load(std::memory_order_acquire) == 0) return;
+  std::lock_guard<std::mutex> lock(ahead->mutex);
+  auto it = ahead->find(encData.data(), encData.size());
+  if(it != ahead->jobs.end())
+    ahead->release(it);
+#endif
+}
+
 unsigned char* Image::bytesOnce() const
 {
   if(data || encData.empty()) return data;
+#ifndef IMAGE_NO_THREADS
+  DecodeAhead* ahead = decodeAhead();
+  if(ahead->registered.load(std::memory_order_acquire) > 0) {
+    std::unique_lock<std::mutex> lock(ahead->mutex);
+    auto it = ahead->find(encData.data(), encData.size());
+    if(it != ahead->jobs.end()) {
+      std::shared_ptr<DecodeJob> job = *it;
+      if(job->state == DecodeJob::RUNNING) {
+        double mpx = double(width)*height/1E6;
+        double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - job->started).count();
+        double remaining = ahead->workerMsPerMpx*mpx - elapsed;
+        bool decodeHere = ahead->workerMsPerMpx > 0 && ahead->localMsPerMpx > 0
+            && remaining > ahead->localMsPerMpx*mpx;
+        if(!decodeHere)
+          ahead->done.wait(lock, [&](){ return job->state == DecodeJob::DONE; });
+      }
+      unsigned char* pixels = job->state == DecodeJob::DONE ? std::exchange(job->pixels, nullptr) : NULL;
+      auto still = ahead->find(encData.data(), encData.size());  // the wait let go of the lock
+      if(still != ahead->jobs.end())
+        ahead->release(still);
+      if(pixels)
+        return pixels;  // else not started yet (now cancelled), dropped as too far behind, or failed
+    }
+  }
+#endif
   int w = 0, h = 0;
+#ifndef IMAGE_NO_THREADS
+  if(width*height >= 512*512) {  // timed, for the choice above
+    auto start = std::chrono::steady_clock::now();
+    unsigned char* pixels = stbi_load_from_memory(encData.data(), encData.size(), &w, &h, NULL, 4);
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    std::lock_guard<std::mutex> lock(ahead->mutex);
+    DecodeAhead::addSample(ahead->localMsPerMpx, ms, double(w)*h/1E6);
+    return pixels;
+  }
+#endif
   return stbi_load_from_memory(encData.data(), encData.size(), &w, &h, NULL, 4);  // request 4 channels (RGBA)
 }
 
@@ -300,6 +487,224 @@ Image::EncodeBuff Image::encodePNG() const
     v.clear();
   return v;
 }
+
+// encodePNGStriped: PNG for big images made once (imported PDF pages).  encodePNG() at stb's level 8 with
+//  its try-every-filter search took 0.6 s for a rendered A4 text page at 300 DPI and 4.7 s for a scan, 80-90%
+//  of an import.  Here rows get the same per-row filter choice as stb's (least sum of absolute values), in
+//  loops that vectorize, and deflate searches 192 match candidates instead of 512 (lazy matching kept):
+//  measured +0.3% bytes on text pages and +3.8% on scans for ~2x less CPU.  The image is cut into stripes
+//  deflated independently on separate threads - a filter only looks one row up, into the source pixels, so
+//  stripes need nothing from each other; all but the last end in a sync flush so the raw deflate streams
+//  join into one zlib stream, and the stripes' Adler-32s combine.  Each stripe is its own IDAT chunk.
+#ifndef NO_MINIZ
+namespace {
+
+constexpr mz_uint STRIPED_PNG_PROBES = 192;
+
+// branchless, so the row loop vectorizes
+inline unsigned char pngPaeth(int a, int b, int c)
+{
+  int pa = abs(b - c), pb = abs(a - c), pc = abs(a + b - 2*c);
+  int notA = (pa > pb) | (pa > pc);
+  int bOrC = pb <= pc ? b : c;
+  return (unsigned char)(notA ? bOrC : a);
+}
+
+// one row with PNG filter `type` (0-4); `prev` NULL for the image's first row, which filters against zeros
+void pngFilterRow(const unsigned char* __restrict row, const unsigned char* __restrict prev, int len, int n,
+    int type, unsigned char* __restrict out)
+{
+  switch(type) {
+  case 0:
+    memcpy(out, row, len);
+    break;
+  case 1:
+    for(int i = 0; i < n; ++i) out[i] = row[i];
+    for(int i = n; i < len; ++i) out[i] = row[i] - row[i-n];
+    break;
+  case 2:
+    if(!prev) memcpy(out, row, len);
+    else for(int i = 0; i < len; ++i) out[i] = row[i] - prev[i];
+    break;
+  case 3:
+    if(!prev) {
+      for(int i = 0; i < n; ++i) out[i] = row[i];
+      for(int i = n; i < len; ++i) out[i] = row[i] - (row[i-n] >> 1);
+    }
+    else {
+      for(int i = 0; i < n; ++i) out[i] = row[i] - (prev[i] >> 1);
+      for(int i = n; i < len; ++i) out[i] = row[i] - ((row[i-n] + prev[i]) >> 1);
+    }
+    break;
+  case 4:
+    if(!prev) {  // Paeth with the row above all zeros is Sub
+      for(int i = 0; i < n; ++i) out[i] = row[i];
+      for(int i = n; i < len; ++i) out[i] = row[i] - row[i-n];
+    }
+    else {
+      for(int i = 0; i < n; ++i) out[i] = row[i] - prev[i];
+      for(int i = n; i < len; ++i) out[i] = row[i] - pngPaeth(row[i-n], prev[i], prev[i-n]);
+    }
+    break;
+  }
+}
+
+// stb's estimate of how well a filtered row compresses: the less, the better
+int pngRowCost(const unsigned char* __restrict line, int len)
+{
+  int cost = 0;
+  for(int i = 0; i < len; ++i) cost += abs((signed char)line[i]);
+  return cost;
+}
+
+uint32_t adler32Combine(uint32_t adler1, uint32_t adler2, uint64_t len2)
+{
+  const uint64_t BASE = 65521;
+  uint64_t rem = len2 % BASE;
+  uint64_t sum1 = adler1 & 0xffff;
+  uint64_t sum2 = (rem*sum1) % BASE;
+  sum1 += (adler2 & 0xffff) + BASE - 1;
+  sum2 += ((adler1 >> 16) & 0xffff) + ((adler2 >> 16) & 0xffff) + BASE - rem;
+  if(sum1 >= BASE) sum1 -= BASE;
+  if(sum1 >= BASE) sum1 -= BASE;
+  if(sum2 >= (BASE << 1)) sum2 -= (BASE << 1);
+  if(sum2 >= BASE) sum2 -= BASE;
+  return uint32_t(sum1 | (sum2 << 16));
+}
+
+void putBE32(Image::EncodeBuff& out, uint32_t value)
+{
+  unsigned char bytes[4] = { (unsigned char)(value >> 24), (unsigned char)(value >> 16),
+      (unsigned char)(value >> 8), (unsigned char)value };
+  out.insert(out.end(), bytes, bytes + 4);
+}
+
+void putPngChunk(Image::EncodeBuff& out, const char* type, const unsigned char* bytes, uint32_t len)
+{
+  putBE32(out, len);
+  size_t start = out.size();
+  out.insert(out.end(), type, type + 4);
+  if(len) out.insert(out.end(), bytes, bytes + len);
+  putBE32(out, uint32_t(mz_crc32(MZ_CRC32_INIT, &out[start], len + 4)));
+}
+
+struct PngStripe {
+  Image::EncodeBuff chunk;  // a complete IDAT chunk
+  uint32_t adler = 1;
+  size_t filteredLen = 0;
+  bool ok = false;
+};
+
+mz_bool appendDeflated(const void* buff, int len, void* user)
+{
+  auto out = static_cast<Image::EncodeBuff*>(user);
+  out->insert(out->end(), (const unsigned char*)buff, (const unsigned char*)buff + len);
+  return MZ_TRUE;
+}
+
+// rows [y0, y1) filtered, raw deflated and wrapped as an IDAT chunk
+void encodePngStripe(const unsigned char* samples, ptrdiff_t stride, int w, int n, int y0, int y1, bool last,
+    PngStripe* stripe)
+{
+  const int len = w*n;
+  Image::EncodeBuff filtered(size_t(len + 1)*(y1 - y0));
+  Image::EncodeBuff trial(size_t(len)*5);
+  for(int y = y0; y < y1; ++y) {
+    const unsigned char* row = samples + y*stride;
+    const unsigned char* prev = y > 0 ? row - stride : NULL;
+    unsigned char* dest = &filtered[size_t(len + 1)*(y - y0)];
+    int best = 0, bestCost = INT32_MAX;
+    for(int type = 0; type < 5; ++type) {
+      pngFilterRow(row, prev, len, n, type, &trial[size_t(len)*type]);
+      int cost = pngRowCost(&trial[size_t(len)*type], len);
+      if(cost < bestCost) { bestCost = cost; best = type; }
+    }
+    dest[0] = (unsigned char)best;
+    memcpy(dest + 1, &trial[size_t(len)*best], len);
+  }
+  Image::EncodeBuff().swap(trial);
+  stripe->filteredLen = filtered.size();
+  stripe->adler = uint32_t(mz_adler32(MZ_ADLER32_INIT, filtered.data(), filtered.size()));
+  Image::EncodeBuff& out = stripe->chunk;
+  out.reserve(filtered.size()/4 + 64);
+  out.resize(8);  // length and type, filled in below
+  // probes as level 6 would set them (no zlib header: -15), then deeper
+  mz_uint flags = tdefl_create_comp_flags_from_zip_params(6, -15, MZ_DEFAULT_STRATEGY);
+  flags = (flags & ~mz_uint(TDEFL_MAX_PROBES_MASK)) | STRIPED_PNG_PROBES;
+  tdefl_compressor* comp = (tdefl_compressor*)malloc(sizeof(tdefl_compressor));
+  stripe->ok = comp && tdefl_init(comp, &appendDeflated, &out, int(flags)) == TDEFL_STATUS_OKAY
+      && tdefl_compress_buffer(comp, filtered.data(), filtered.size(), last ? TDEFL_FINISH : TDEFL_SYNC_FLUSH)
+          == (last ? TDEFL_STATUS_DONE : TDEFL_STATUS_OKAY);
+  free(comp);
+  uint32_t dataLen = uint32_t(out.size() - 8);
+  for(int i = 0; i < 4; ++i)
+    out[i] = (unsigned char)(dataLen >> (24 - 8*i));
+  memcpy(&out[4], "IDAT", 4);
+  putBE32(out, uint32_t(mz_crc32(MZ_CRC32_INIT, &out[4], dataLen + 4)));
+}
+
+}  // namespace
+
+Image::EncodeBuff Image::encodePNGStriped(const unsigned char* samples, int w, int h, int channels,
+    ptrdiff_t stride, int threads)
+{
+  static const unsigned char colorType[5] = {0, 0, 4, 2, 6};
+  if(!samples || w <= 0 || h <= 0 || channels < 1 || channels > 4)
+    return EncodeBuff();
+#ifdef IMAGE_NO_THREADS
+  threads = 1;
+#endif
+  // stripes of at least 64 rows: each restarts the match history, which costs a little compression
+  int nstripes = std::max(1, std::min(threads, h/64));
+  std::vector<PngStripe> stripes(nstripes);
+  std::vector<std::thread> workers;
+  for(int ii = 0; ii < nstripes; ++ii) {
+    int y0 = int(int64_t(h)*ii/nstripes), y1 = int(int64_t(h)*(ii + 1)/nstripes);
+    bool last = ii == nstripes - 1;
+    if(last)  // on this thread
+      encodePngStripe(samples, stride, w, channels, y0, y1, true, &stripes[ii]);
+    else
+      workers.emplace_back(encodePngStripe, samples, stride, w, channels, y0, y1, false, &stripes[ii]);
+  }
+  for(std::thread& worker : workers)
+    worker.join();
+
+  EncodeBuff out;
+  size_t total = 0;
+  for(const PngStripe& stripe : stripes) {
+    if(!stripe.ok) return EncodeBuff();
+    total += stripe.chunk.size();
+  }
+  out.reserve(total + 64);
+  static const unsigned char signature[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+  out.insert(out.end(), signature, signature + 8);
+  unsigned char ihdr[13] = { (unsigned char)(w >> 24), (unsigned char)(w >> 16), (unsigned char)(w >> 8),
+      (unsigned char)w, (unsigned char)(h >> 24), (unsigned char)(h >> 16), (unsigned char)(h >> 8),
+      (unsigned char)h, 8, colorType[channels], 0, 0, 0 };
+  putPngChunk(out, "IHDR", ihdr, 13);
+  const unsigned char zlibHeader[2] = {0x78, 0x9C};  // deflate, 32K window, default level
+  putPngChunk(out, "IDAT", zlibHeader, 2);
+  uint32_t adler = 1;
+  for(const PngStripe& stripe : stripes) {
+    out.insert(out.end(), stripe.chunk.begin(), stripe.chunk.end());
+    adler = adler32Combine(adler, stripe.adler, stripe.filteredLen);
+  }
+  const unsigned char adlerBytes[4] = { (unsigned char)(adler >> 24), (unsigned char)(adler >> 16),
+      (unsigned char)(adler >> 8), (unsigned char)adler };
+  putPngChunk(out, "IDAT", adlerBytes, 4);
+  putPngChunk(out, "IEND", NULL, 0);
+  return out;
+}
+#else
+Image::EncodeBuff Image::encodePNGStriped(const unsigned char* samples, int w, int h, int channels,
+    ptrdiff_t stride, int threads)
+{
+  EncodeBuff out;
+  if(!stbi_write_png_to_func(&stbi_write_vec, &out, w, h, channels, samples, int(stride)))
+    out.clear();
+  return out;
+}
+#endif  // NO_MINIZ
 
 Image::EncodeBuff Image::encodeJPEG(int quality) const
 {

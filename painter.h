@@ -256,6 +256,8 @@ public:
 
   // static methods
   static void invalidateImage(int handle, int len);
+  // true if drawing `image` would use a cached texture (plain or night mode) rather than its pixels
+  static bool isImageCached(const Image& image);
   static void initFontStash(int flags, int pad = 4, float pixdist = 32.0f);
   static bool loadFont(const char* name, const char* filename, Painter* painter = NULL);
   static bool loadFontMem(const char* name, unsigned char* data, int len, Painter* painter = NULL);

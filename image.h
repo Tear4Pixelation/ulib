@@ -43,6 +43,19 @@ public:
   EncodeBuff encode(Encoding dflt) const;  // dflt=PNG
   EncodeBuff encodePNG() const;
   EncodeBuff encodeJPEG(int quality = 75) const;
+  // PNG of tightly packed 8-bit samples (`channels` 1-4 a pixel, rows `stride` bytes apart), for a big
+  //  image made once - an imported PDF page.  Rows are filtered as encodePNG() filters them, then deflated
+  //  in independent horizontal stripes on up to `threads` threads (one IDAT chunk each) with a shallower
+  //  match search than encodePNG()'s level 8, which spent seconds a page on scans.  Lossless: it decodes to
+  //  exactly the pixels given; the bytes differ from encodePNG()'s.  Empty on failure.
+  static EncodeBuff encodePNGStriped(const unsigned char* samples, int w, int h, int channels,
+      ptrdiff_t stride, int threads);
+  // Start decoding this image's encoded bytes on a worker thread, for an image about to be drawn (the page
+  //  after the visible ones): bytesOnce() then takes the pixels from the worker instead of decoding a
+  //  300 DPI page on the UI thread, waiting for it if it is still running.  Only for an image that has
+  //  encoded bytes and no pixels; at most a couple are held at once, the oldest dropped first.  Returns
+  //  true if a decode is pending or was started.  A no-op without threads (wasm).
+  bool prefetchDecode() const;
 
   void fill(unsigned int color);
   void fillRect(Rect rect, unsigned int color);
@@ -67,6 +80,7 @@ public:
   static Image fromPixels(int w, int h, unsigned char* d, Encoding imgfmt = UNKNOWN);
   static Image fromPixelsNoCopy(int w, int h, unsigned char* d, Encoding imgfmt = UNKNOWN);
 protected:
+  void dropPrefetch() const;
   Image(int w, int h, unsigned char* d, Encoding imgfmt, EncodeBuff encdata = EncodeBuff())
       : width(w), height(h), data(d), encData(encdata), encoding(imgfmt), painterHandle(-1) {}
   Image(const Image& other);

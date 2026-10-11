@@ -532,6 +532,15 @@ void Painter::invalidateImage(int handle, int len)
   }
 }
 
+bool Painter::isImageCached(const Image& image)
+{
+  Painter* cache = cachingPainter;
+  if(!cache || cache->imgHandles.empty())
+    return false;
+  int oldest = cache->imgHandles.front();
+  return image.painterHandle >= oldest || image.mappedHandle >= oldest;
+}
+
 void Painter::setAtlasTextThreshold(float thresh)
 {
   atlasTextThresh = thresh;
