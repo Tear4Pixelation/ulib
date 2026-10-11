@@ -121,6 +121,7 @@ public:
     bool darkBackdrop = false;  // see setDarkBackdrop()
     bool antiAlias = true;
     bool sRGBAdjAlpha = false;
+    bool strokeUnderFill = false;  // see setStrokeUnderFill()
   };
   std::vector<PainterState> painterStates;
 
@@ -216,6 +217,9 @@ public:
   const Brush& strokeBrush() const { return currState().strokeBrush; }
   void setVectorEffect(VectorEffect veffect) { currState().strokeEffect = veffect; }
   VectorEffect vectorEffect() const { return currState().strokeEffect; }
+  // stroke before fill (fill painted over the stroke) - same pixels as drawing the path twice, stroke-only
+  //  then fill-only, but the path is submitted and flattened once (selected strokes, Element::applyStyle)
+  void setStrokeUnderFill(bool under) { currState().strokeUnderFill = under; }
   void setStrokeCap(CapStyle cap);
   CapStyle strokeCap() const { return currState().strokeCap; }
   void setStrokeJoin(JoinStyle join);
