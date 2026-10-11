@@ -310,35 +310,46 @@ int realToStr(char* str, Real f, int prec)
   if(negative)
     f = -f;
   // separate integer and decimal part; scale and round decimal part based on requested precision
+  // (this arithmetic must stay exactly as it is: it decides every digit written - realtostrtest.cpp
+  //  compares against the original digit-at-a-time version)
   int whole = int(f);
   int frac = int((f - whole) * powers_of_10[prec] + Real(0.5));
-  int ii = 0;
   if(frac != 0) {
-    // skip trailing zeros; separate while()s appears to be faster for random numbers
+    // skip trailing zeros
     while(prec > 0 && frac % 10 == 0) { frac /= 10; --prec; }
-    while(ii < prec) {
-      str[ii++] = '0' + char(frac % 10);
-      frac /= 10;
-    }
-    if(ii > 0)
-      str[ii++] = '.';
+    // frac rounded up to 10^prec (e.g. 1.9999999999999): the trailing zero strip leaves frac = 1, prec = 0,
+    //  so no fraction digits and a carry into the integer part
+    if(prec == 0)
+      whole += 1;
   }
   else if(whole == 0) {
-    str[ii] = '0';  // main reason for this is to prevent "-0"
+    str[0] = '0';  // main reason for this is to prevent "-0"
     return 1;
   }
-  if(frac >= 1)  // this is needed for, e.g., 1.9999999999999
-    whole += 1;
-  // print at least one digit before decimal
-  do {
-    str[ii++] = '0' + char(whole % 10);
-    whole /= 10;
-  } while(whole > 0);
-  // print minus sign if negative
+  else
+    prec = 0;  // integer: no fraction digits
+  // digits are written in place, right to left, two at a time from a digit pair table
+  static const char* pairs = "00010203040506070809101112131415161718192021222324252627282930313233343536373839"
+      "40414243444546474849505152535455565758596061626364656667686970717273747576777879808182838485868788899091"
+      "9293949596979899";
+  unsigned int w = (unsigned int)whole;
+  int nwhole = 1;
+  for(unsigned int lim = 10; nwhole < 10 && w >= lim; lim *= 10) ++nwhole;
+  int len = (negative ? 1 : 0) + nwhole + (prec > 0 ? prec + 1 : 0);
+  char* p = str + len;
+  if(prec > 0) {
+    unsigned int fr = (unsigned int)frac;  // exactly prec digits, leading zeros included
+    int nd = prec;
+    while(nd >= 2) { unsigned int q = fr/100; p -= 2; memcpy(p, pairs + 2*(fr - q*100), 2); fr = q; nd -= 2; }
+    if(nd) *--p = char('0' + fr);
+    *--p = '.';
+  }
+  while(w >= 100) { unsigned int q = w/100; p -= 2; memcpy(p, pairs + 2*(w - q*100), 2); w = q; }
+  if(w >= 10) { p -= 2; memcpy(p, pairs + 2*w, 2); }
+  else *--p = char('0' + w);
   if(negative)
-    str[ii++] = '-';
-  std::reverse(str, str+ii);
-  return ii;
+    *--p = '-';
+  return len;
 }
 
 #define UTF8_ACCEPT 0

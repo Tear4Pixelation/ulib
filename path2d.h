@@ -40,6 +40,13 @@ public:
   void setFillRule(FillRule rule) { fillRule = rule; }
 
   void reserve(size_t n, bool cmds = false) { points.reserve(n); if(cmds) commands.reserve(n); }
+  // drop unused capacity of both vectors (e.g. after parsing); not shrink_to_fit(), which libstdc++ makes a
+  //  no-op without exceptions - a copy is allocated at exactly size()
+  void shrinkToFit()
+  {
+    if(points.capacity() > points.size()) std::vector<Point>(points.begin(), points.end()).swap(points);
+    if(commands.capacity() > commands.size()) std::vector<PathCommand>(commands.begin(), commands.end()).swap(commands);
+  }
   bool isSimple() const { return commands.empty(); }
   int size() const { return points.size(); }
   bool empty() const { return points.empty(); }

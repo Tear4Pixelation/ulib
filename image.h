@@ -46,13 +46,14 @@ public:
   Image& subtract(const Image& other, int scale=1, int offset=0);
 
   EncodeBuff encode(Encoding dflt) const;  // dflt=PNG
+  // RGBA PNG via encodePNGStriped() (on more threads the bigger the image), cached in encData if that is empty
   EncodeBuff encodePNG() const;
   EncodeBuff encodeJPEG(int quality = 75) const;
-  // PNG of tightly packed 8-bit samples (`channels` 1-4 a pixel, rows `stride` bytes apart), for a big
-  //  image made once - an imported PDF page.  Rows are filtered as encodePNG() filters them, then deflated
-  //  in independent horizontal stripes on up to `threads` threads (one IDAT chunk each) with a shallower
-  //  match search than encodePNG()'s level 8, which spent seconds a page on scans.  Lossless: it decodes to
-  //  exactly the pixels given; the bytes differ from encodePNG()'s.  Empty on failure.
+  // PNG of tightly packed 8-bit samples (`channels` 1-4 a pixel, rows `stride` bytes apart).  Rows are
+  //  filtered as stb's PNG writer filters them, then deflated in independent horizontal stripes on up to
+  //  `threads` threads (one IDAT chunk each) with a shallower match search than stb's level 8, which spent
+  //  seconds a page on scans.  Lossless: it decodes to exactly the pixels given; the bytes differ from stb's.
+  //  Empty on failure.
   static EncodeBuff encodePNGStriped(const unsigned char* samples, int w, int h, int channels,
       ptrdiff_t stride, int threads);
   // Start decoding this image's encoded bytes on a worker thread, for an image about to be drawn (the page

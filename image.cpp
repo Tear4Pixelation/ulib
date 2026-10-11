@@ -488,23 +488,27 @@ static void stbi_write_vec(void* context, void* data, int size)
 }
 
 // use of encData: can be used for PNG or JPEG, but PNG never overwrites JPEG
+// Not stb's writer (level 8, every filter tried per row in scalar loops) but encodePNGStriped(): the same
+//  per-row filter choice and lossless, so the same pixels decode; ~2x less CPU on one thread for thumbnails
+//  and screenshots (and slightly smaller files), ~+2% bytes on photos; big images (scans) on several threads.
 Image::EncodeBuff Image::encodePNG() const
 {
-  //stbi_write_png_compression_level = quality;
   if(encData.size() > 4 && memcmp(encData.data(), "\x89PNG", 4) == 0)
     return encData;
   auto* b = constBytes();
   if(!b) return {};
-  EncodeBuff vbuff;
-  EncodeBuff& v = encData.empty() ? encData : vbuff;
-  v.reserve(dataLen()/4);  // guess at compressed size
-  // returns 0 on failure ...
-  if(!stbi_write_png_to_func(&stbi_write_vec, &v, width, height, 4, b, width*4))
-    v.clear();
-  return v;
+  // a thread per 256K pixels, at most 8: a thumbnail stays on this thread
+  int64_t pixels = int64_t(width)*height;
+  int threads = int(std::max(int64_t(1), std::min(int64_t(std::min(8u, std::max(1u, std::thread::hardware_concurrency()))),
+      pixels >> 18)));
+  EncodeBuff v = encodePNGStriped(b, width, height, 4, ptrdiff_t(width)*4, threads);  // empty on failure
+  if(!encData.empty())
+    return v;
+  encData = std::move(v);
+  return encData;
 }
 
-// encodePNGStriped: PNG for big images made once (imported PDF pages).  encodePNG() at stb's level 8 with
+// encodePNGStriped: PNG for big images made once (imported PDF pages), and encodePNG().  stb's writer at level 8 with
 //  its try-every-filter search took 0.6 s for a rendered A4 text page at 300 DPI and 4.7 s for a scan, 80-90%
 //  of an import.  Here rows get the same per-row filter choice as stb's (least sum of absolute values), in
 //  loops that vectorize, and deflate searches 192 match candidates instead of 512 (lazy matching kept):
